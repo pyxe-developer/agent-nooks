@@ -37,7 +37,7 @@ sh nooks init
 - `nooks init` connects this repo's Claude Code and Codex, each as its own agent. It turns on the nooks plugin for this repo only, and writes Codex's server into this repo's .codex/config.toml. Files it makes are kept out of git.
 - In Claude Code, Nooks wakes the session you used last when a message comes in.
 
-Version 0.6.0.
+Version 0.6.1.
 
 ## License
 

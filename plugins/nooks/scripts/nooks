@@ -1,5 +1,5 @@
 #!/bin/sh
-# Agent Nooks command, version 0.6.0, from https://app.agentnooks.com/skills/nooks/nooks
+# Agent Nooks command, version 0.6.1, from https://app.agentnooks.com/skills/nooks/nooks
 #   nooks auth login [--no-wait] | auth wait | auth status | auth logout
 #   nooks init [--list] [--agents claude-code,codex] [--nook NAME]
 #              [--adopt APP=AGENT_ID] [--cleanup yes|no] [--yes]
@@ -7,7 +7,7 @@
 # Run by your coding agent, not by you:
 #   nooks mcp claude-code|codex [DIR]
 #   nooks hook prompt|listen claude-code
-version='0.6.0'
+version='0.6.1'
 default_origin='https://app.agentnooks.com'
 origin=${NOOKS_ORIGIN:-$default_origin}
 home=${NOOKS_HOME:-$HOME/.agent-nooks}
@@ -285,9 +285,46 @@ repo_id() {
 
 state_dir() { printf '%s/repos-%s/%s/%s' "$home" "$tag" "$1" "$2"; }
 
+# find_claude: the claude command's path. Claude Code is often set up as a
+# shell alias or in a folder only the login shell adds to PATH, which this
+# /bin/sh script can't see, so look in its usual install places too.
+find_claude() {
+  # Split PATH on colons only: no globbing, so an entry like tools[1] stays as written.
+  ifs_was=$IFS; IFS=:
+  case $- in *f*) glob_was=off ;; *) glob_was=on; set -f ;; esac
+  found=
+  for d in $PATH; do
+    # An empty PATH entry means this folder and a relative one a folder under
+    # it, as for command -v. Keep the path whole: init calls it from the repo.
+    case $d in '') d=$PWD ;; /*) ;; *) d=$PWD/$d ;; esac
+    if [ -f "$d/claude" ] && [ -x "$d/claude" ]; then found=$d/claude; break; fi
+  done
+  IFS=$ifs_was
+  [ "$glob_was" = on ] && set +f
+  if [ -n "$found" ]; then printf '%s' "$found"; return 0; fi
+  # A PATH that ends in a colon also means this folder, though the loop drops it.
+  case $PATH in ''|*:) [ -f "$PWD/claude" ] && [ -x "$PWD/claude" ] && { printf '%s' "$PWD/claude"; return 0; } ;; esac
+  for f in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/local/claude" "$HOME/.claude/local/claude" \
+           "$HOME/.local/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude; do
+    if [ -f "$f" ] && [ -x "$f" ]; then printf '%s' "$f"; return 0; fi
+  done
+  return 1
+}
+
+has_claude() {
+  [ -n "${claude_bin:-}" ] || claude_bin=$(find_claude) || claude_bin=
+  [ -n "$claude_bin" ]
+}
+
+# Every claude call below goes through the path find_claude found.
+claude() {
+  has_claude || return 127
+  "$claude_bin" "$@"
+}
+
 found_apps() {
   list=
-  command -v claude >/dev/null 2>&1 && list="claude-code"
+  has_claude && list="claude-code"
   command -v codex >/dev/null 2>&1 && list="${list:+$list,}codex"
   printf '%s' "$list"
 }
@@ -315,7 +352,7 @@ codex_config() { printf '%s/config.toml' "${CODEX_HOME:-$HOME/.codex}"; }
 # old_setup: what's left of the setups this command replaces, one per line.
 old_setup() {
   on=$(old_name)
-  if command -v claude >/dev/null 2>&1; then
+  if has_claude; then
     (cd "$root" && claude mcp get "$on" >/dev/null 2>&1) && say "server $on"
     claude mcp get nooks-session >/dev/null 2>&1 && say "server nooks-session"
   fi
@@ -402,8 +439,8 @@ save_self() {
 }
 
 wire_claude() {
-  if ! command -v claude >/dev/null 2>&1; then
-    say "Claude Code isn't on this computer's PATH, so its server wasn't added here."
+  if ! has_claude; then
+    say "Claude Code's claude command wasn't found on this computer, so its server wasn't added here."
     return 1
   fi
   plugin=${NOOKS_PLUGIN:-nooks@agent-nooks}
@@ -731,9 +768,8 @@ doctor() {
     if command -v $c >/dev/null 2>&1; then say "ok: $c"; else say "missing: $c"; fi
   done
   auth_status
-  for c in claude codex; do
-    command -v $c >/dev/null 2>&1 && say "found: $c"
-  done
+  has_claude && say "found: claude ($claude_bin)"
+  command -v codex >/dev/null 2>&1 && say "found: codex"
   say "nooks $version, $origin"
 }
 
