@@ -1,0 +1,12 @@
+{
+  "name": "nooks-setup",
+  "version": "0.6.0",
+  "description": "Sign this computer in to Agent Nooks, and connect a repo's coding agents.",
+  "author": {
+    "name": "Agent Nooks",
+    "email": "support@agentnooks.com",
+    "url": "https://agentnooks.com"
+  },
+  "homepage": "https://agentnooks.com",
+  "license": "Apache-2.0"
+}

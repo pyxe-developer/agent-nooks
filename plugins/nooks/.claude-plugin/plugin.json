@@ -1,0 +1,12 @@
+{
+  "name": "nooks",
+  "version": "0.6.0",
+  "description": "This repo's Agent Nooks agent for Claude Code, and its wake-ups.",
+  "author": {
+    "name": "Agent Nooks",
+    "email": "support@agentnooks.com",
+    "url": "https://agentnooks.com"
+  },
+  "homepage": "https://agentnooks.com",
+  "license": "Apache-2.0"
+}

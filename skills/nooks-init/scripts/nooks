@@ -1,0 +1,1003 @@
+#!/bin/sh
+# Agent Nooks command, version 0.6.0, from https://app.agentnooks.com/skills/nooks/nooks
+#   nooks auth login [--no-wait] | auth wait | auth status | auth logout
+#   nooks init [--list] [--agents claude-code,codex] [--nook NAME]
+#              [--adopt APP=AGENT_ID] [--cleanup yes|no] [--yes]
+#   nooks status | doctor | version
+# Run by your coding agent, not by you:
+#   nooks mcp claude-code|codex [DIR]
+#   nooks hook prompt|listen claude-code
+version='0.6.0'
+default_origin='https://app.agentnooks.com'
+origin=${NOOKS_ORIGIN:-$default_origin}
+home=${NOOKS_HOME:-$HOME/.agent-nooks}
+umask 077
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'nooks: %s\n' "$*" >&2; exit 1; }
+
+origin_ok() {
+  case $1 in https://*|http://127.0.0.1:*|http://localhost:*) ;; *) return 1 ;; esac
+  case $1 in *[!A-Za-z0-9.:/_-]*) return 1 ;; esac
+  return 0
+}
+case $origin in
+  https://*|http://127.0.0.1:*|http://localhost:*) ;;
+  *) die "NOOKS_ORIGIN must be an https address." ;;
+esac
+origin_ok "$origin" || die "NOOKS_ORIGIN must be a plain address."
+
+sha() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | cut -d ' ' -f 1
+}
+
+# Everything this command keeps is per Nooks address, named from a SHA-256 of
+# the address itself: two servers never see each other's keys, even when each
+# is the default of the copy that talks to it, and no address can be made to
+# share another's name.
+use_origin() {
+  origin=$1
+  tag=$(printf '%s' "$origin" | sha)
+  case $tag in *[!0-9a-f]*|'') die "This computer needs shasum or sha256sum." ;; esac
+  key_file="$home/computer_key-$tag"
+  key_service="agent-nooks-$tag"
+  pending="$home/login-$tag.pending"
+}
+use_origin "$origin"
+
+# The nooks plugin runs its own copy, whose default may be another address
+# than the one nooks init used. init leaves the address for that repo here, and
+# the plugin's server and hooks use it when no NOOKS_ORIGIN is set.
+origin_note() { printf '%s/origin-for-%s' "$home" "$(printf '%s' "$1" | sha)"; }
+repo_origin() {
+  [ -z "${NOOKS_ORIGIN:-}" ] || return 0
+  [ -r "$(origin_note "$1")" ] || return 0
+  read -r o < "$(origin_note "$1")" 2>/dev/null || return 0
+  origin_ok "$o" && use_origin "$o"
+}
+
+use_keychain() {
+  [ "${NOOKS_KEYCHAIN:-1}" != 0 ] && [ "$(uname -s 2>/dev/null)" = Darwin ] \
+    && command -v security >/dev/null 2>&1
+}
+
+key_ok_text() {
+  case $1 in nkc_*[!A-Za-z0-9_-]*) return 1 ;; nkc_?*) return 0 ;; esac
+  return 1
+}
+
+key_get() {
+  k=
+  if use_keychain; then
+    k=$(security find-generic-password -s "$key_service" -a computer-key -w 2>/dev/null) || k=
+  fi
+  key_ok_text "$k" || k=$(cat "$key_file" 2>/dev/null)
+  key_ok_text "$k" || return 1
+  printf '%s' "$k"
+}
+
+# key_put KEY: the Keychain when there is one; otherwise a file only you can read.
+# `security -i` reads its command on stdin, so the key never shows in the process list.
+key_put() {
+  mkdir -p "$home" && chmod 700 "$home" || return 1
+  if use_keychain; then
+    printf 'add-generic-password -U -s %s -a computer-key -w %s\n' "$key_service" "$1" \
+      | security -i >/dev/null 2>&1
+    if [ "$(security find-generic-password -s "$key_service" -a computer-key -w 2>/dev/null)" = "$1" ]; then
+      rm -f "$key_file"
+      return 0
+    fi
+    say "Your Keychain didn't take the key, so it's saved in $key_file, which only you can read." >&2
+  fi
+  printf '%s' "$1" > "$key_file.new" && chmod 600 "$key_file.new" && mv "$key_file.new" "$key_file"
+}
+
+key_forget() {
+  if use_keychain; then
+    security delete-generic-password -s "$key_service" -a computer-key >/dev/null 2>&1
+  fi
+  rm -f "$key_file"
+}
+
+scratch() { mktemp -d "${TMPDIR:-/tmp}/nooks.XXXXXX" || die "Couldn't make a temporary folder."; }
+
+# auth_header FILE: the computer key as a curl header file.
+auth_header() {
+  k=$(key_get) || return 1
+  printf 'Authorization: Bearer %s\n' "$k" > "$1"
+}
+
+# post HEADERS PATH BODY OUT [SECONDS] [MAX_BYTES]: sets code to the HTTP status, or 000.
+post() {
+  code=$(curl -sS -o "$4" -w '%{http_code}' --max-time "${5:-30}" --max-filesize "${6:-1048576}" \
+    -X POST -H 'Content-Type: application/json' -H "@$1" --data-binary "@$3" \
+    "$origin$2" 2>/dev/null) || code=000
+}
+
+# jstr FILE KEY: the first string value for KEY in a JSON answer.
+jstr() {
+  grep -oE "\"$2\": *\"([^\"\\\\]|\\\\.)*\"" "$1" 2>/dev/null | head -n 1 \
+    | sed -E "s/^\"$2\": *\"//; s/\"\$//"
+}
+
+# jesc TEXT: TEXT inside a JSON string.
+jesc() { printf '%s' "$1" | tr -d '\000-\037' | sed 's/[\\"]/\\&/g'; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "This needs $1."; }
+
+open_link() {
+  [ -n "${NOOKS_NO_OPEN:-}" ] && return 0
+  if command -v open >/dev/null 2>&1; then open "$1" >/dev/null 2>&1 &
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$1" >/dev/null 2>&1 &
+  fi
+}
+
+# signed_in: 0 signed in, 1 not, 2 Agent Nooks couldn't be reached,
+# 3 paused. A key Nooks refuses (the computer was removed in Settings) is
+# forgotten; a paused one is kept, since it works again on resume.
+signed_in() {
+  t=$(scratch)
+  if ! auth_header "$t/h"; then rm -rf "$t"; return 1; fi
+  printf '{"action":"choices"}' > "$t/in"
+  post "$t/h" /computer/repo "$t/in" "$t/out" 20
+  case $code in
+    200)
+      rm -rf "$t"
+      if use_keychain && [ -r "$key_file" ]; then key_put "$(cat "$key_file")"; fi
+      return 0 ;;
+    403) if is_paused "$t/out"; then rm -rf "$t"; return 3; fi ;;
+  esac
+  rm -rf "$t"
+  case $code in 401|403) key_forget; return 1 ;; esac
+  return 2
+}
+
+# is_paused FILE: whether Nooks answered that the owner paused their connection.
+is_paused() { [ "$(jstr "$1" error)" = "connection is paused" ]; }
+paused_text="Agent Nooks is paused for your account. Resume it in Settings, then try again."
+
+# auth_login [--no-wait]: ask Nooks to allow this computer, then wait for the tap.
+# An agent runs it with --no-wait, shows its owner the link, then runs auth wait.
+auth_login() {
+  need curl
+  signed_in; state=$?
+  if [ $state = 0 ]; then say "This computer is already signed in to Agent Nooks."; return 0; fi
+  if [ $state = 2 ]; then die "Agent Nooks couldn't be reached. Try again in a minute."; fi
+  if [ $state = 3 ]; then die "$paused_text"; fi
+  t=$(scratch)
+  printf '{"app":"cli"}' > "$t/in"
+  printf 'Accept: application/json\n' > "$t/h"
+  post "$t/h" /computer/start "$t/in" "$t/out"
+  device=$(jstr "$t/out" device_code)
+  phrase=$(jstr "$t/out" phrase)
+  link=$(jstr "$t/out" allow_url)
+  rm -rf "$t"
+  case $device in nkd_*[!A-Za-z0-9_-]*|'') device= ;; esac
+  case $link in https://*|http://127.0.0.1:*|http://localhost:*) ;; *) link= ;; esac
+  case $link in *[!A-Za-z0-9.:/_?=%-]*) link= ;; esac
+  if [ -z "$device" ] || [ -z "$phrase" ] || [ -z "$link" ]; then
+    die "Agent Nooks didn't start the sign-in. Try again in a minute."
+  fi
+  mkdir -p "$home" && chmod 700 "$home" || die "Couldn't make $home."
+  printf '%s\n' "$device" > "$pending"
+  say "Open this link and allow this computer: $link"
+  say "The page must show this phrase: $phrase"
+  open_link "$link"
+  [ "${1:-}" = --no-wait ] && return 0
+  auth_wait
+}
+
+# auth_wait: about nine minutes, so a 10-minute tool timeout covers it.
+auth_wait() {
+  signed_in; state=$?
+  if [ $state = 0 ]; then rm -f "$pending"; say "This computer is already signed in to Agent Nooks."; return 0; fi
+  if [ $state = 3 ]; then die "$paused_text"; fi
+  device=$(cat "$pending" 2>/dev/null)
+  case $device in nkd_?*) ;; *) die "Nothing is waiting to be allowed. Run: nooks auth login" ;; esac
+  case $device in *[!A-Za-z0-9_-]*) die "Nothing is waiting to be allowed. Run: nooks auth login" ;; esac
+  say "Waiting for you to click Allow..."
+  t=$(scratch)
+  printf 'Accept: application/json\n' > "$t/h"
+  printf '{"device_code":"%s"}' "$device" > "$t/in"
+  tries=0
+  while [ $tries -lt "${NOOKS_LOGIN_TRIES:-180}" ]; do
+    tries=$((tries + 1))
+    post "$t/h" /computer/token "$t/in" "$t/out" 20
+    case $(jstr "$t/out" state) in
+      allowed)
+        key=$(jstr "$t/out" computer_key)
+        rm -rf "$t" "$pending"
+        key_ok_text "$key" || die "Agent Nooks allowed it but sent no key. Run nooks auth login again."
+        key_put "$key" || die "Couldn't save the key."
+        say "Signed in. Next, in each repo, run: nooks init"
+        return 0 ;;
+      denied) rm -rf "$t" "$pending"; die "You chose not to allow this computer." ;;
+      expired) rm -rf "$t" "$pending"; die "The link expired. Run nooks auth login for a new one." ;;
+    esac
+    sleep "${NOOKS_POLL_SECONDS:-3}"
+  done
+  rm -rf "$t"
+  die "Still waiting for Allow. Run nooks auth wait when you're ready."
+}
+
+auth_status() {
+  signed_in; state=$?
+  case $state in
+    0) say "Signed in to Agent Nooks at $origin." ;;
+    1) say "Not signed in. Run: nooks auth login"; return 1 ;;
+    3) say "This computer is signed in, but $paused_text"; return 3 ;;
+    *) say "A key is saved, but Agent Nooks couldn't be reached to check it."; return 2 ;;
+  esac
+}
+
+auth_logout() {
+  t=$(scratch)
+  if auth_header "$t/h"; then
+    printf '{}' > "$t/in"
+    post "$t/h" /computer/forget "$t/in" "$t/out" 20
+    case $code in
+      200|401|403) ;;
+      *) rm -rf "$t"; die "Agent Nooks couldn't be reached, so the key is still saved. Try again." ;;
+    esac
+  fi
+  rm -rf "$t"
+  key_forget
+  say "Signed out. This computer's key no longer works, and its sessions left Agent Nooks."
+}
+
+# --- repos ---------------------------------------------------------------
+
+repo_root() {
+  r=$(cd "${1:-.}" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) || r=
+  [ -n "$r" ] || r=$(cd "${1:-.}" 2>/dev/null && pwd -P) || r=
+  printf '%s' "$r"
+}
+
+
+# norm_url URL: host/path, with no scheme, user or .git, the host in lower case.
+# A port stays unless it is the scheme's usual one: two servers on one host
+# are two repos, while ssh://host:22/x and host:x are the same one.
+norm_url() {
+  scheme=$(printf '%s' "$1" | sed -nE 's#^([A-Za-z][A-Za-z0-9+.-]*)://.*#\1#p' | tr 'A-Z' 'a-z')
+  case $scheme in ssh|git+ssh|ssh+git) dp=22 ;; https) dp=443 ;; http) dp=80 ;; git) dp=9418 ;; *) dp=none ;; esac
+  n=$(printf '%s' "$1" | sed -E '
+s#^[A-Za-z][A-Za-z0-9+.-]*://##
+t scheme
+s#^[^@/]*@##
+s#^([^/:]+):#\1/#
+b rest
+:scheme
+s#^[^@/]*@##
+s#^([^/:]+):'"$dp"'/#\1/#
+:rest
+s#/+$##
+s#\.git$##')
+  host=${n%%/*}
+  printf '%s%s' "$(printf '%s' "$host" | tr 'A-Z' 'a-z')" "${n#"$host"}"
+}
+
+# repo_id ROOT: the repo's id, the same in every clone of it.
+repo_id() {
+  url=$(git -C "$1" remote get-url origin 2>/dev/null) || url=
+  if [ -n "$url" ]; then ident=$(norm_url "$url"); else ident="path:$1"; fi
+  printf '%s' "$ident" | sha
+}
+
+state_dir() { printf '%s/repos-%s/%s/%s' "$home" "$tag" "$1" "$2"; }
+
+found_apps() {
+  list=
+  command -v claude >/dev/null 2>&1 && list="claude-code"
+  command -v codex >/dev/null 2>&1 && list="${list:+$list,}codex"
+  printf '%s' "$list"
+}
+
+app_title() { case $1 in claude-code) printf 'Claude Code' ;; codex) printf 'Codex' ;; esac; }
+
+# The repo's own exclude file, so files made here stay out of git.
+exclude() {
+  ex=$(git -C "$root" rev-parse --path-format=absolute --git-path info/exclude 2>/dev/null) || return 0
+  [ -n "$ex" ] || return 0
+  git -C "$root" check-ignore -q "$1" 2>/dev/null && return 0
+  mkdir -p "$(dirname "$ex")" && printf '/%s\n' "$1" >> "$ex"
+}
+
+# The old per-project server name from the Agent Nooks skill: nooks-PROJECT-CODE.
+old_name() {
+  project=$(basename "$root" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9]/-/g' | cut -c1-30)
+  code6=$(printf '%s' "$root" | sha | cut -c1-6)
+  printf 'nooks-%s-%s' "$project" "$code6"
+}
+
+claude_dir() { printf '%s' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"; }
+codex_config() { printf '%s/config.toml' "${CODEX_HOME:-$HOME/.codex}"; }
+
+# old_setup: what's left of the setups this command replaces, one per line.
+old_setup() {
+  on=$(old_name)
+  if command -v claude >/dev/null 2>&1; then
+    (cd "$root" && claude mcp get "$on" >/dev/null 2>&1) && say "server $on"
+    claude mcp get nooks-session >/dev/null 2>&1 && say "server nooks-session"
+  fi
+  [ -e "$(claude_dir)/nooks/$on.key" ] && say "file $(claude_dir)/nooks/$on.key"
+  [ -d "$root/.claude/skills/agent-nooks" ] && say "folder $root/.claude/skills/agent-nooks"
+  for d in "$(claude_dir)/skills/nooks-up" "$(claude_dir)/skills/nooks-down" \
+           "$HOME/.agents/skills/nooks-up" "$HOME/.agents/skills/nooks-down"; do
+    [ -d "$d" ] && say "folder $d"
+  done
+  grep -q '^\[mcp_servers\.nooks-session\]' "$(codex_config)" 2>/dev/null && say "codex nooks-session"
+  for f in bridge.sh listen.sh allow.pending; do [ -e "$home/$f" ] && say "file $home/$f"; done
+  [ -d "$home/run" ] && say "folder $home/run"
+  grep -q 'Agent Nooks' "$root/CLAUDE.local.md" 2>/dev/null && say "edit $root/CLAUDE.local.md"
+  grep -q 'listen.sh' "$root/.claude/settings.local.json" 2>/dev/null && say "edit $root/.claude/settings.local.json"
+  return 0
+}
+
+remove_old() {
+  old_setup | while read -r kind what; do
+    case $kind in
+      server)
+        if [ "$what" = nooks-session ]; then claude mcp remove nooks-session -s user >/dev/null 2>&1
+        else (cd "$root" && claude mcp remove "$what" -s local >/dev/null 2>&1); fi
+        say "Removed the old $what server." ;;
+      file) rm -f "$what" && say "Removed $what." ;;
+      folder) rm -rf "$what" && say "Removed $what." ;;
+      codex)
+        cfg=$(codex_config)
+        awk 'BEGIN{skip=0} /^\[/{skip=($0=="[mcp_servers.nooks-session]")} !skip' "$cfg" > "$cfg.new" \
+          && mv "$cfg.new" "$cfg" && say "Removed the old nooks-session server from $cfg." ;;
+      edit)
+        case $what in
+          *CLAUDE.local.md) say "Still to do: remove the Agent Nooks section from $what." ;;
+          *) say "Still to do: remove the hooks that run listen.sh from $what." ;;
+        esac ;;
+    esac
+  done
+}
+
+# ask PROMPT DEFAULT: an answer typed at the terminal, or DEFAULT.
+ask() {
+  printf '%s ' "$1" > /dev/tty
+  answer=
+  read -r answer < /dev/tty || answer=
+  [ -n "$answer" ] || answer=$2
+  printf '%s' "$answer"
+}
+
+can_ask() { [ -z "$yes" ] && [ -t 1 ] && ( : < /dev/tty ) 2>/dev/null; }
+
+# choices: the agents this repo could take over, and your open nooks, one per line.
+choices() {
+  printf '{"action":"choices","folder":"%s"}' "$(jesc "$folder")" > "$t/in"
+  post "$t/h" /computer/repo "$t/in" "$t/choices" 30
+  [ "$code" = 200 ] || die "Agent Nooks couldn't list your agents (HTTP $code)."
+  tr '}' '\n' < "$t/choices" | while IFS= read -r line; do
+    printf '%s\n' "$line" > "$t/line"
+    a=$(jstr "$t/line" agent)
+    nk=$(jstr "$t/line" nook_id)
+    n=$(jstr "$t/line" name)
+    if [ -n "$a" ]; then
+      case $line in *'"matches_this_repo": true'*) m=" (matches this repo)" ;; *) m= ;; esac
+      say "agent $a $n$m"
+    elif [ -n "$nk" ]; then
+      say "nook $nk $n"
+    fi
+  done
+}
+
+# one_adopt VALUE: each --adopt holds exactly one APP=AGENT_ID, never blank.
+one_adopt() {
+  case $1 in ''|*[!A-Za-z0-9_=-]*) die "--adopt takes APP=AGENT_ID." ;; esac
+}
+
+save_self() {
+  mkdir -p "$home/bin" && chmod 700 "$home"
+  if [ -f "$0" ] && [ ! "$0" -ef "$home/bin/nooks" ]; then
+    cp "$0" "$home/bin/nooks.new" && mv "$home/bin/nooks.new" "$home/bin/nooks"
+  elif [ ! -f "$home/bin/nooks" ]; then
+    curl -fsSL --max-time 60 "$origin/skills/nooks/nooks" -o "$home/bin/nooks.new" \
+      && mv "$home/bin/nooks.new" "$home/bin/nooks"
+  fi
+  chmod 700 "$home/bin/nooks" 2>/dev/null
+}
+
+wire_claude() {
+  if ! command -v claude >/dev/null 2>&1; then
+    say "Claude Code isn't on this computer's PATH, so its server wasn't added here."
+    return 1
+  fi
+  plugin=${NOOKS_PLUGIN:-nooks@agent-nooks}
+  if (cd "$root" && { claude plugin install "$plugin" --scope local >/dev/null 2>&1 \
+        || claude plugin enable "$plugin" --scope local >/dev/null 2>&1; }); then
+    exclude .claude/settings.local.json
+    # The plugin's copy has its own default address: leave this repo's
+    # address for it, so it signs in to the server init used.
+    note=$(origin_note "$root")
+    printf '%s\n' "$origin" > "$note.new" && mv "$note.new" "$note"
+    say "Claude Code: turned on the nooks plugin in this repo. Start a new Claude Code session here to use it."
+    return 0
+  fi
+  add="claude mcp add --scope local -e NOOKS_ORIGIN=$origin nooks -- /bin/sh $home/bin/nooks mcp claude-code"
+  got=$(cd "$root" && claude mcp get nooks 2>/dev/null) || got=
+  if [ -n "$got" ]; then
+    case $got in
+      *"$home/bin/nooks"*) ;;
+      *)
+        say "Claude Code: this repo already has a different server named nooks, so it wasn't changed. Remove it, then run: $add"
+        return 1 ;;
+    esac
+    # Compare the whole address, so one that only starts with this one
+    # still counts as another address.
+    had=$(printf '%s\n' "$got" | sed -nE 's/^[[:space:]]*NOOKS_ORIGIN=([^[:space:]]*).*$/\1/p' | head -n 1)
+    if [ "$had" = "$origin" ]; then
+      say "Claude Code: the nooks server is already in this repo. For wake-ups, install the nooks plugin: claude plugin install $plugin --scope local"
+      return 0
+    fi
+    # One an earlier `nooks init` added, for another address: add it again.
+    (cd "$root" && claude mcp remove nooks -s local >/dev/null 2>&1)
+  fi
+  if (cd "$root" && claude mcp add --scope local -e "NOOKS_ORIGIN=$origin" nooks -- /bin/sh "$home/bin/nooks" mcp claude-code >/dev/null 2>&1); then
+    say "Claude Code: added the nooks server in this repo. For wake-ups, install the nooks plugin: claude plugin install $plugin --scope local"
+    return 0
+  fi
+  say "Claude Code: couldn't add the nooks server. Run: $add"
+  return 1
+}
+
+wire_codex() {
+  cfg="$root/.codex/config.toml"
+  path=$(printf '%s' "$home/bin/nooks" | sed 's/[\\"]/\\&/g')
+  where=$(printf '%s' "$root" | sed 's/[\\"]/\\&/g')
+  block=$(printf '[mcp_servers.nooks]\ncommand = "/bin/sh"\nargs = ["%s", "mcp", "codex", "%s"]\nenv = { NOOKS_ORIGIN = "%s" }\ndefault_tools_approval_mode = "approve"\n' "$path" "$where" "$origin")
+  # Sets on for each line of the [mcp_servers.nooks] table and its
+  # sub-tables. Text inside a multi-line string is never a table header.
+  # Reads the config one character at a time, as TOML does: a line is a table
+  # header only outside any string and any array, so text such as
+  # "[mcp_servers.nooks]" inside a string or an array is never taken for one.
+  toml_on='function scan(s,   n, i, c, t) {
+      n = length(s); i = 1
+      while (i <= n) {
+        c = substr(s, i, 1)
+        if (ml == q3) {
+          if (c == bs) { i += 2; continue }
+          if (substr(s, i, 3) == q3) { i += 3; t = 0; while (t < 2 && substr(s, i, 1) == dq) { i++; t++ }; ml = ""; continue }
+          i++; continue
+        }
+        if (ml == s3) {
+          if (substr(s, i, 3) == s3) { i += 3; t = 0; while (t < 2 && substr(s, i, 1) == sq) { i++; t++ }; ml = ""; continue }
+          i++; continue
+        }
+        if (c == "#") return
+        if (c == dq) {
+          if (substr(s, i, 3) == q3) { ml = q3; i += 3; continue }
+          i++
+          while (i <= n) { c = substr(s, i, 1); if (c == bs) { i += 2; continue }; i++; if (c == dq) break }
+          continue
+        }
+        if (c == sq) {
+          if (substr(s, i, 3) == s3) { ml = s3; i += 3; continue }
+          i++
+          while (i <= n) { c = substr(s, i, 1); i++; if (c == sq) break }
+          continue
+        }
+        if (c == "[") depth++
+        else if (c == "]" && depth > 0) depth--
+        i++
+      }
+    }
+    BEGIN { on = 0; ml = ""; depth = 0; dq = "\""; bs = "\\"; q3 = dq dq dq; s3 = sq sq sq }
+    {
+      if (ml == "" && depth == 0 && $0 ~ /^[[:space:]]*\[/) {
+        h = $0; sub(/^[[:space:]]+/, "", h); sub(/[[:space:]]*#.*$/, "", h); sub(/[[:space:]]+$/, "", h)
+        on = (h == "[mcp_servers.nooks]" || index(h, "[mcp_servers.nooks.") == 1)
+      }
+      else scan($0)
+    }'
+  # The [mcp_servers.nooks] table now there, with its sub-tables, blank lines left out.
+  have=$(awk -v sq="'" "$toml_on"' on && NF' "$cfg" 2>/dev/null)
+  if [ -n "$have" ] && [ "$have" = "$block" ]; then
+    say "Codex: the nooks server is already in $cfg."
+    return 0
+  fi
+  if git -C "$root" ls-files --error-unmatch .codex/config.toml >/dev/null 2>&1; then
+    say "Codex: $cfg is shared in git, so it wasn't changed. Add this to your own Codex config instead:"
+    say "$block"
+    return 1
+  fi
+  if [ -n "$have" ]; then
+    # One `nooks init` wrote, for another address or folder: put this one in
+    # its place. A nooks server someone else wrote stays as it is.
+    case $have in
+      *'/bin/nooks", "mcp", "codex", "'*) ;;
+      *)
+        say "Codex: $cfg already has a different server named nooks, so it wasn't changed. Replace it with:"
+        say "$block"
+        return 1 ;;
+    esac
+    awk -v sq="'" "$toml_on"' !on' "$cfg" > "$cfg.new" \
+      && printf '%s\n' "$block" >> "$cfg.new" && mv "$cfg.new" "$cfg" \
+      || { rm -f "$cfg.new"; say "Codex: couldn't write $cfg."; return 1; }
+    say "Codex: updated the nooks server in $cfg."
+    return 0
+  fi
+  new=
+  [ -e "$cfg" ] || new=1
+  mkdir -p "$root/.codex" && { [ -z "$new" ] && printf '\n'; printf '%s\n' "$block"; } >> "$cfg" \
+    || { say "Codex: couldn't write $cfg."; return 1; }
+  [ -n "$new" ] && exclude .codex/config.toml
+  say "Codex: added the nooks server in $cfg. Codex uses it once you trust this folder."
+}
+
+init() {
+  list= agents= nook= cleanup= yes= adopts=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --list) list=1 ;;
+      --agents) agents=$2; shift ;;
+      --agents=*) agents=${1#*=} ;;
+      --nook) nook=$2; shift ;;
+      --nook=*) nook=${1#*=} ;;
+      --adopt) one_adopt "${2:-}"; adopts="$adopts $2"; shift ;;
+      --adopt=*) one_adopt "${1#*=}"; adopts="$adopts ${1#*=}" ;;
+      --cleanup) cleanup=$2; shift ;;
+      --cleanup=*) cleanup=${1#*=} ;;
+      --yes|-y) yes=1 ;;
+      *) die "Unknown option $1. See: nooks help" ;;
+    esac
+    shift
+  done
+  need curl
+  need git
+  case $cleanup in ''|yes|no) ;; *) die "--cleanup takes yes or no." ;; esac
+  signed_in; state=$?
+  if [ $state = 2 ]; then die "Agent Nooks couldn't be reached. Try again in a minute."; fi
+  if [ $state = 3 ]; then die "$paused_text"; fi
+  if [ $state = 1 ]; then
+    if can_ask && [ -z "$list" ]; then auth_login || exit 1
+    else die "This computer isn't signed in. Run: nooks auth login"; fi
+  fi
+  root=$(repo_root .)
+  [ -n "$root" ] || die "Couldn't find this folder."
+  id=$(repo_id "$root")
+  folder=$(basename "$root" | cut -c1-200)
+  t=$(scratch)
+  trap 'rm -rf "$t"' EXIT
+  auth_header "$t/h" || die "This computer isn't signed in. Run: nooks auth login"
+  choices > "$t/list"
+  old_setup > "$t/old"
+
+  if [ -n "$list" ]; then
+    say "Repo: $root"
+    say "Coding agents on this computer: $(found_apps | sed 's/,/, /g')"
+    printf '{"action":"status","repo":"%s"}' "$id" > "$t/in"
+    post "$t/h" /computer/repo "$t/in" "$t/status" 30
+    tr '}' '\n' < "$t/status" | while IFS= read -r line; do
+      printf '%s\n' "$line" > "$t/line"
+      a=$(jstr "$t/line" agent)
+      [ -n "$a" ] && say "Already set up here: $(jstr "$t/line" app) as $(jstr "$t/line" name) ($a)"
+    done
+    if grep -q '^agent ' "$t/list"; then
+      say "Agents you could keep for this repo (--adopt APP=AGENT_ID):"
+      sed -n 's/^agent /  /p' "$t/list"
+    fi
+    if grep -q '^nook ' "$t/list"; then
+      say "Your open nooks (--nook NAME):"
+      sed -nE 's/^nook [^ ]+ /  /p' "$t/list"
+    fi
+    if [ -s "$t/old" ]; then
+      say "Old Agent Nooks setup here (--cleanup yes removes it):"
+      sed 's/^[a-z]* /  /' "$t/old"
+    fi
+    return 0
+  fi
+
+  if [ -z "$agents" ]; then
+    agents=$(found_apps)
+    if can_ask; then agents=$(ask "Which coding agents should join Agent Nooks from this repo? [${agents:-claude-code,codex}]" "${agents:-claude-code,codex}"); fi
+    [ -n "$agents" ] || die "No Claude Code or Codex here. Name them with --agents claude-code,codex"
+  fi
+  apps=
+  for a in $(printf '%s' "$agents" | tr ', ' '  '); do
+    case $a in
+      claude-code|claude) a=claude-code ;;
+      codex) ;;
+      *) die "Agent Nooks can connect claude-code and codex so far, not $a." ;;
+    esac
+    case " $apps " in *" $a "*) ;; *) apps="$apps $a" ;; esac
+  done
+  [ -n "$apps" ] || die "Name the coding agents with --agents claude-code,codex"
+  for pair in $adopts; do
+    papp=${pair%%=*}
+    [ "$papp" = claude ] && papp=claude-code
+    case " $apps " in *" $papp "*) ;; *) die "--adopt names $papp, which isn't in --agents." ;; esac
+    case ${pair#*=} in
+      ag_[0-9a-f]*) case ${pair#*=} in *[!a-z0-9_]*) die "--adopt takes APP=AGENT_ID." ;; esac ;;
+      *) die "--adopt takes APP=AGENT_ID." ;;
+    esac
+  done
+  if [ -z "$adopts" ] && can_ask && grep -q '^agent ' "$t/list"; then
+    for a in $apps; do
+      say "Your agents this repo could keep:" > /dev/tty
+      awk '/^agent /{n++; sub(/^agent /, ""); print "  " n ". " $0}' "$t/list" > /dev/tty
+      pick=$(ask "Keep one of these as $(app_title "$a") here? Type its number, or press Return for a new agent." "")
+      case $pick in ''|*[!0-9]*) continue ;; esac
+      ag=$(awk -v n="$pick" '/^agent /{k++; if (k==n) print $2}' "$t/list")
+      [ -n "$ag" ] && adopts="$adopts $a=$ag"
+    done
+  fi
+  if [ -z "$nook" ] && can_ask; then
+    nook=$(ask "Join or start a nook? Type its name, or press Return to skip." "")
+  fi
+  if [ -z "$cleanup" ] && [ -s "$t/old" ]; then
+    if can_ask; then
+      say "Old Agent Nooks setup found here:" > /dev/tty
+      sed 's/^[a-z]* /  /' "$t/old" > /dev/tty
+      case $(ask "Remove it now? [y/N]" n) in y|Y|yes) cleanup=yes ;; *) cleanup=no ;; esac
+    else
+      cleanup=no
+    fi
+  fi
+
+  save_self
+  failed= unwired=
+  for a in $apps; do
+    adopt=
+    for pair in $adopts; do
+      [ "${pair#*=}" != "$pair" ] || die "--adopt takes APP=AGENT_ID."
+      papp=${pair%%=*}
+      [ "$papp" = claude ] && papp=claude-code
+      [ "$papp" = "$a" ] || continue
+      adopt=${pair#*=}
+    done
+    case $adopt in ''|ag_[0-9a-f]*) ;; *) die "--adopt takes APP=AGENT_ID." ;; esac
+    case $adopt in *[!a-z0-9_]*) die "--adopt takes APP=AGENT_ID." ;; esac
+    body="{\"action\":\"init\",\"repo\":\"$id\",\"folder\":\"$(jesc "$folder")\",\"apps\":[{\"app\":\"$a\""
+    [ -n "$adopt" ] && body="$body,\"adopt\":\"$adopt\""
+    body="$body}]"
+    [ -n "$nook" ] && body="$body,\"nook\":\"$(jesc "$nook")\""
+    printf '%s}' "$body" > "$t/in"
+    post "$t/h" /computer/repo "$t/in" "$t/out" 60
+    case $code in
+      200) ;;
+      401|403)
+        is_paused "$t/out" && die "$paused_text"
+        die "Agent Nooks refused this computer's key. Run: nooks auth login" ;;
+      409) say "$(app_title "$a"): $(jstr "$t/out" error)."; failed=1; continue ;;
+      429) die "Too many tries. Wait a minute and run nooks init again." ;;
+      *) say "$(app_title "$a"): Agent Nooks answered HTTP $code: $(jstr "$t/out" error)"; failed=1; continue ;;
+    esac
+    name=$(jstr "$t/out" name)
+    agent=$(jstr "$t/out" agent)
+    s=$(state_dir "$id" "$a")
+    mkdir -p "$s" && chmod 700 "$s"
+    printf '%s\n' "$root" > "$s/root"
+    wk=$(jstr "$t/out" wake_key)
+    if [ -n "$wk" ]; then
+      printf '%s' "$wk" > "$s/wake.key.new" && chmod 600 "$s/wake.key.new" && mv "$s/wake.key.new" "$s/wake.key"
+      rm -f "$s/off"
+    fi
+    if grep -q '"adopted": true' "$t/out"; then say "$(app_title "$a") here is now $name ($agent), the agent you kept."
+    elif grep -q '"new": true' "$t/out"; then say "$(app_title "$a") here joined Agent Nooks as $name ($agent)."
+    else say "$(app_title "$a") here is still $name ($agent)."; fi
+    if grep -q '"nook_error"' "$t/out"; then say "  The nook: $(jstr "$t/out" nook_error)"
+    elif grep -q '"nook"' "$t/out"; then
+      if grep -q '"started": true' "$t/out"; then say "  Started the nook $nook."
+      else say "  Joined the nook $nook."; fi
+    fi
+    # An app the server set up but this repo couldn't be wired for keeps
+    # the old setup too: it may be the only way that app reaches Nooks.
+    case $a in claude-code) wire_claude || unwired=1 ;; codex) wire_codex || unwired=1 ;; esac
+  done
+  if [ "$cleanup" = yes ]; then
+    # The old setup stays until every agent picked here is set up, so a
+    # failed init never leaves this repo with no way to reach Nooks.
+    if [ -z "$failed$unwired" ]; then remove_old
+    else say "Kept the old Agent Nooks setup, since not every agent here is connected yet. Fix what's above, then run nooks init again."; fi
+  fi
+  [ -z "$failed$unwired" ] || exit 1
+}
+
+status() {
+  auth_status || return 0
+  root=$(repo_root .)
+  id=$(repo_id "$root")
+  t=$(scratch)
+  auth_header "$t/h" || { rm -rf "$t"; return 0; }
+  printf '{"action":"status","repo":"%s"}' "$id" > "$t/in"
+  post "$t/h" /computer/repo "$t/in" "$t/out" 30
+  say "Repo: $root"
+  any=
+  tr '}' '\n' < "$t/out" | while IFS= read -r line; do
+    printf '%s\n' "$line" > "$t/line"
+    a=$(jstr "$t/line" agent)
+    [ -n "$a" ] || continue
+    c=connected
+    case $line in *'"connected": false'*) c="not connected: run nooks init" ;; esac
+    say "  $(jstr "$t/line" app): $(jstr "$t/line" name) ($a), $c"
+  done
+  grep -q '"agent"' "$t/out" 2>/dev/null || say "  No agents here yet. Run: nooks init"
+  s=$(state_dir "$id" claude-code)
+  if [ -r "$s/wake.key" ]; then
+    read -r asid apid < "$s/active" 2>/dev/null || asid=
+    if [ -n "$apid" ] && kill -0 "$apid" 2>/dev/null; then say "  Wake-ups go to the Claude Code session used last ($asid)."
+    else say "  Wake-ups: no Claude Code session is open here."; fi
+    [ -e "$s/off" ] && say "  Agent Nooks refused the wake key. Run nooks init again."
+  fi
+  rm -rf "$t"
+}
+
+doctor() {
+  for c in curl git; do
+    if command -v $c >/dev/null 2>&1; then say "ok: $c"; else say "missing: $c"; fi
+  done
+  auth_status
+  for c in claude codex; do
+    command -v $c >/dev/null 2>&1 && say "found: $c"
+  done
+  say "nooks $version, $origin"
+}
+
+# --- MCP -----------------------------------------------------------------
+
+# mcp APP [DIR]: one JSON-RPC line in, one line out (none for a notification).
+mcp_max=67108864
+
+serve_mcp() {
+  app=$1
+  case $app in claude-code|codex) ;; *) die "Usage: nooks mcp claude-code|codex [DIR]" ;; esac
+  root=$(repo_root "${2:-${CLAUDE_PROJECT_DIR:-.}}")
+  repo_origin "$root"
+  id=$(repo_id "$root")
+  t=$(scratch)
+  trap 'rm -rf "$t"' EXIT
+  trap 'exit 0' TERM INT HUP
+  headers() {
+    auth_header "$t/h" || return 1
+    printf 'Nooks-Repo: %s\nNooks-App: %s\n' "$id" "$app" >> "$t/h"
+  }
+  headers; signed=$?
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    printf '%s' "$line" > "$t/in"
+    rid=$(grep -oE '"id" *: *(-?[0-9]+|"[^"]*")' "$t/in" | head -n 1 | sed -E 's/^"id" *: *//')
+    if [ $signed != 0 ]; then
+      headers; signed=$?
+    fi
+    if [ $signed != 0 ]; then
+      [ -n "$rid" ] || continue
+      if grep -qE '"method" *: *"initialize"' "$t/in"; then
+        pv=$(jstr "$t/in" protocolVersion)
+        case $pv in ''|*[!0-9-]*) pv=2025-06-18 ;; esac
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"nooks","version":"%s"},"instructions":"This computer is not signed in to Agent Nooks. Ask your owner to run nooks auth login in a terminal, then nooks init in this repo."}}\n' "$rid" "$pv" "$version"
+      elif grep -qE '"method" *: *"tools/list"' "$t/in"; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}\n' "$rid"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32001,"message":"This computer is not signed in to Agent Nooks. Ask your owner to run nooks auth login."}}\n' "$rid"
+      fi
+      continue
+    fi
+    # A tool's answer can be far bigger than the 1 MB other answers get: a
+    # full nook_read, or a shared file, sent as escaped JSON inside JSON.
+    post "$t/h" /mcp "$t/in" "$t/out" 60 "$mcp_max"
+    if [ "$code" = 401 ]; then
+      # Signed in again since this server started: take the new key once.
+      headers && post "$t/h" /mcp "$t/in" "$t/out" 60 "$mcp_max"
+    fi
+    case $code in
+      200) tr -d '\r\n' < "$t/out"; printf '\n' ;;
+      202) ;;
+      *)
+        if [ -n "$rid" ] && [ "$code" = 403 ] && is_paused "$t/out"; then
+          printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32001,"message":"Your owner paused Agent Nooks. It works again once they resume it in Settings."}}\n' "$rid"
+        elif [ -n "$rid" ] && [ -s "$t/out" ] && grep -q '"jsonrpc"' "$t/out"; then
+          tr -d '\r\n' < "$t/out"; printf '\n'
+        elif [ -n "$rid" ]; then
+          printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"Agent Nooks could not be reached (HTTP %s). Try again."}}\n' "$rid" "$code"
+        fi ;;
+    esac
+  done
+}
+
+# --- Claude Code hooks ----------------------------------------------------
+
+# The Claude Code process: the hook's parent, past any shell in between.
+claude_pid() {
+  p=$PPID
+  n=0
+  while [ $n -lt 6 ]; do
+    c=$(ps -o comm= -p "$p" 2>/dev/null | sed 's#.*/##; s/^-//')
+    case $c in
+      sh|bash|zsh|dash|ksh)
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+        n=$((n + 1)) ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "$p"
+}
+
+hook_setup() {
+  input=$(cat | tr -d '\n')
+  sid=$(printf '%s' "$input" | sed -nE 's/.*"session_id" *: *"([A-Za-z0-9._:-]{1,128})".*/\1/p')
+  dir=${CLAUDE_PROJECT_DIR:-$PWD}
+  root=$(repo_root "$dir")
+  [ -n "$root" ] && [ -n "$sid" ] || exit 0
+  repo_origin "$root"
+  s=$(state_dir "$(repo_id "$root")" claude-code)
+  kf="$s/wake.key"
+  [ -r "$kf" ] || exit 0
+  cp=$(claude_pid)
+}
+
+# UserPromptSubmit: this session is now the one used last. Prints nothing.
+# If this computer's wake key was refused (another computer ran nooks init
+# here), using a session here takes wake-ups back: the computer used last wins.
+hook_prompt() {
+  hook_setup
+  printf '%s %s\n' "$sid" "$cp" > "$s/active.new" && mv "$s/active.new" "$s/active"
+  if [ -e "$s/off" ] && [ ! "$kf" -nt "$s/off" ]; then take_wake; fi
+  exit 0
+}
+
+take_wake() {
+  t=$(mktemp -d "${TMPDIR:-/tmp}/nooks.XXXXXX" 2>/dev/null) || return 0
+  if auth_header "$t/h"; then
+    printf '{"action":"wake","repo":"%s"}' "$(repo_id "$root")" > "$t/in"
+    post "$t/h" /computer/repo "$t/in" "$t/out" 10
+    if [ "$code" = 200 ]; then
+      wk=$(jstr "$t/out" wake_key)
+      case $wk in
+        nkl_*) printf '%s' "$wk" > "$kf.new" && chmod 600 "$kf.new" && mv "$kf.new" "$kf" && rm -f "$s/off" ;;
+      esac
+    fi
+  fi
+  rm -rf "$t"
+}
+
+# Take over wake-ups when the session that had them is gone.
+claim() {
+  [ -d "$s/claim" ] && find "$s/claim" -prune -mmin +1 -exec rmdir {} \; 2>/dev/null
+  mkdir "$s/claim" 2>/dev/null || return 0
+  read -r asid apid < "$s/active" 2>/dev/null || apid=
+  if [ -z "$apid" ] || ! kill -0 "$apid" 2>/dev/null; then
+    printf '%s %s\n' "$sid" "$cp" > "$s/active.new" && mv "$s/active.new" "$s/active"
+  fi
+  rmdir "$s/claim" 2>/dev/null
+}
+
+nap() {
+  sleep "$1" &
+  child=$!
+  wait "$child"
+  child=
+}
+
+# SessionStart and Stop (asyncRewake): wait for Agent Nooks, exit 2 to wake this session.
+hook_listen() {
+  hook_setup
+  fresh=0
+  case $input in *'"hook_event_name"'*'"SessionStart"'*) fresh=1 ;; esac
+  off="$s/off"
+  if [ -e "$off" ] && [ ! "$kf" -nt "$off" ]; then exit 0; fi
+  pf="$s/listen-$sid.pid"
+  if [ -r "$pf" ]; then
+    read -r op ocp < "$pf"
+    if [ -n "$op" ] && kill -0 "$op" 2>/dev/null \
+       && ps -p "$op" -o args= 2>/dev/null | grep -q 'hook listen'; then
+      if [ "$ocp" = "$cp" ] && [ $fresh = 0 ]; then exit 0; fi
+      kill "$op" 2>/dev/null
+    fi
+  fi
+  echo "$$ $cp" > "$pf"
+  # A session that starts takes wake-ups only when no open session has them.
+  claim
+  ack_file="$s/ack"
+  child=
+  body="$s/listen-$sid.body"
+  trap '[ -n "$child" ] && kill "$child" 2>/dev/null; rm -f "$body" "$body.code"; exit 0' TERM INT HUP
+  started=$(date +%s)
+  delay=5
+  while kill -0 "$cp" 2>/dev/null; do
+    [ -r "$kf" ] || break
+    read -r owner _rest 2>/dev/null < "$pf"
+    [ "$owner" = "$$" ] || break
+    [ $(( $(date +%s) - started )) -lt 85800 ] || break
+    read -r asid apid 2>/dev/null < "$s/active" || asid=
+    if [ "$asid" != "$sid" ]; then
+      # Another session was used last. Wait here, at no cost, and take over
+      # if it closes.
+      if [ -z "$apid" ] || ! kill -0 "$apid" 2>/dev/null; then claim; fi
+      read -r asid apid 2>/dev/null < "$s/active" || asid=
+      [ "$asid" = "$sid" ] || nap "${NOOKS_LOCAL_SECONDS:-5}"
+      continue
+    fi
+    key=$(cat "$kf" 2>/dev/null)
+    sum=$(printf '%s' "$key" | sha)
+    ack=0
+    ack_for=
+    [ -r "$ack_file" ] && read -r ack ack_for < "$ack_file"
+    [ "$ack_for" = "$sum" ] || ack=0
+    case $ack in ''|*[!0-9]*) ack=0 ;; esac
+    printf 'Authorization: Bearer %s\n' "$key" | \
+      curl -sS -o "$body" -w '%{http_code}' --max-time "${NOOKS_WAIT_SECONDS:-75}" --max-filesize 65536 -H @- \
+        "$origin/listen?ack=$ack&fresh=$fresh&taken=1" > "$body.code" 2>/dev/null &
+    child=$!
+    wait "$child"
+    status=$?
+    child=
+    code=$(cat "$body.code" 2>/dev/null)
+    [ "$status" = 0 ] || code=failed
+    case $code in
+      200)
+        # The owner may have moved to another session while this wait was
+        # open: leave the news unacknowledged for that session's wait.
+        read -r asid apid 2>/dev/null < "$s/active" || asid=
+        if [ "$asid" != "$sid" ]; then rm -f "$body" "$body.code"; continue; fi
+        delivery=$(sed -n '1s/^delivery \([0-9][0-9]*\)$/\1/p' "$body")
+        [ -n "$delivery" ] && echo "$delivery $sum" > "$ack_file"
+        sed '1d' "$body" >&2
+        rm -f "$body" "$body.code" "$pf"
+        exit 2 ;;
+      204) fresh=0; delay=5 ;;
+      409) nap "${NOOKS_LOCAL_SECONDS:-5}" ;;
+      401|403)
+        if [ "$(cat "$kf" 2>/dev/null)" != "$key" ]; then fresh=1; delay=5; continue; fi
+        touch "$off"
+        echo "Agent Nooks refused this repo's wake key: another computer took wake-ups for this repo, or this one was signed out. Wake-ups come back here the next time your owner sends this session a message; if they don't, run nooks init in this repo again." >&2
+        rm -f "$body" "$body.code" "$pf"
+        exit 2 ;;
+      *)
+        nap "$delay"
+        delay=$(( delay * 2 ))
+        [ "$delay" -le 300 ] || delay=300 ;;
+    esac
+  done
+  rm -f "$body" "$body.code"
+  read -r owner _rest 2>/dev/null < "$pf"
+  [ "$owner" = "$$" ] && rm -f "$pf"
+  exit 0
+}
+
+usage() {
+  say "Agent Nooks $version"
+  say "  nooks auth login      Sign this computer in, once."
+  say "      --no-wait         Show the link and stop. Then run: nooks auth wait"
+  say "  nooks auth status     Check the sign-in."
+  say "  nooks auth logout     Sign this computer out."
+  say "  nooks init            Connect this repo's coding agents."
+  say "      --list            Show what init would ask about, and change nothing."
+  say "      --agents LIST     claude-code, codex, or both."
+  say "      --nook NAME       Join or start this nook."
+  say "      --adopt APP=ID    Keep one of your agents as this repo's APP agent."
+  say "      --cleanup yes|no  Remove the old Agent Nooks setup here."
+  say "      --yes             Ask nothing."
+  say "  nooks status          This repo's agents and wake-ups."
+  say "  nooks doctor          Check this computer."
+}
+
+cmd=${1:-help}
+[ $# -gt 0 ] && shift
+case $cmd in
+  auth)
+    sub=${1:-}
+    case $sub in
+      login) auth_login "${2:-}" ;;
+      wait) auth_wait ;;
+      status) auth_status ;;
+      logout) auth_logout ;;
+      *) die "Usage: nooks auth login [--no-wait] | wait | status | logout" ;;
+    esac ;;
+  init) init "$@" ;;
+  status) status ;;
+  doctor) doctor ;;
+  mcp) serve_mcp "$@" ;;
+  hook)
+    case ${1:-} in
+      prompt) hook_prompt ;;
+      listen) hook_listen ;;
+      *) die "Usage: nooks hook prompt|listen claude-code" ;;
+    esac ;;
+  version|--version|-v) say "nooks $version" ;;
+  help|--help|-h) usage ;;
+  *) usage; exit 1 ;;
+esac
