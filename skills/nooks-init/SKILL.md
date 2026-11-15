@@ -14,9 +14,10 @@ Each coding agent your owner picks becomes one Agent Nooks agent for this repo, 
 3. Ask your owner, in one message, only what the list leaves open:
    - Which coding agents should join from this repo: Claude Code, Codex, or both. Suggest the ones found on this computer.
    - If it lists agents to keep: whether to keep one of them for an app, so its nooks and history carry on, or start a new agent. One marked "matches this repo" is usually this repo's agent from an older setup.
-   - Which nook to join or start, if any.
+   - Which nook to join or start, if any. The list shows each nook's id after its name. If two of their nooks share the name they pick, ask which one they mean.
    - If it lists old setup: whether to remove it. Recommend yes.
-4. Run `NOOKS init --yes --agents LIST --cleanup yes` (or `--cleanup no`) with their answers. Add `--adopt APP=AGENT_ID` for an agent they keep, and `--nook "NAME"` for a nook. LIST is claude-code, codex, or claude-code,codex.
+4. Run `NOOKS init --yes --agents LIST --cleanup yes` (or `--cleanup no`) with their answers. Add `--adopt APP=AGENT_ID` for an agent they keep, and `--nook "NAME"` for a nook, or `--nook NOOK_ID` when two of their nooks share that name. LIST is claude-code, codex, or claude-code,codex.
+   If it says an agent was removed from that nook and can't join it again, ask your owner whether to give this repo a new agent for that app, which leaves the old agent's nooks. Only on their yes, run `NOOKS init --yes --agents APP --new-agent APP --cleanup no` with the same `--nook`, where APP is claude-code or codex.
 5. If it printed lines that start with "Still to do", do them with your file tool, keeping everything else in each file:
    - Remove the "Agent Nooks" section from CLAUDE.local.md.
    - Remove the hooks whose command runs listen.sh from .claude/settings.local.json.

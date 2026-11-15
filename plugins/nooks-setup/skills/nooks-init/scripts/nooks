@@ -1,13 +1,13 @@
 #!/bin/sh
-# Agent Nooks command, version 0.6.1, from https://app.agentnooks.com/skills/nooks/nooks
+# Agent Nooks command, version 0.6.2, from https://app.agentnooks.com/skills/nooks/nooks
 #   nooks auth login [--no-wait] | auth wait | auth status | auth logout
-#   nooks init [--list] [--agents claude-code,codex] [--nook NAME]
-#              [--adopt APP=AGENT_ID] [--cleanup yes|no] [--yes]
+#   nooks init [--list] [--agents claude-code,codex] [--nook NAME|ID]
+#              [--adopt APP=AGENT_ID] [--new-agent APP] [--cleanup yes|no] [--yes]
 #   nooks status | doctor | version
 # Run by your coding agent, not by you:
 #   nooks mcp claude-code|codex [DIR]
 #   nooks hook prompt|listen claude-code
-version='0.6.1'
+version='0.6.2'
 default_origin='https://app.agentnooks.com'
 origin=${NOOKS_ORIGIN:-$default_origin}
 home=${NOOKS_HOME:-$HOME/.agent-nooks}
@@ -566,7 +566,7 @@ wire_codex() {
 }
 
 init() {
-  list= agents= nook= cleanup= yes= adopts=
+  list= agents= nook= cleanup= yes= adopts= fresh=
   while [ $# -gt 0 ]; do
     case $1 in
       --list) list=1 ;;
@@ -576,6 +576,8 @@ init() {
       --nook=*) nook=${1#*=} ;;
       --adopt) one_adopt "${2:-}"; adopts="$adopts $2"; shift ;;
       --adopt=*) one_adopt "${1#*=}"; adopts="$adopts ${1#*=}" ;;
+      --new-agent) fresh="$fresh ${2:-}"; shift ;;
+      --new-agent=*) fresh="$fresh ${1#*=}" ;;
       --cleanup) cleanup=$2; shift ;;
       --cleanup=*) cleanup=${1#*=} ;;
       --yes|-y) yes=1 ;;
@@ -618,8 +620,8 @@ init() {
       sed -n 's/^agent /  /p' "$t/list"
     fi
     if grep -q '^nook ' "$t/list"; then
-      say "Your open nooks (--nook NAME):"
-      sed -nE 's/^nook [^ ]+ /  /p' "$t/list"
+      say "Your open nooks (--nook NAME, or its id when two share a name):"
+      sed -nE 's/^nook ([^ ]+) (.*)$/  \2 (\1)/p' "$t/list"
     fi
     if [ -s "$t/old" ]; then
       say "Old Agent Nooks setup here (--cleanup yes removes it):"
@@ -643,10 +645,22 @@ init() {
     case " $apps " in *" $a "*) ;; *) apps="$apps $a" ;; esac
   done
   [ -n "$apps" ] || die "Name the coding agents with --agents claude-code,codex"
+  fresh_apps=
+  for a in $(printf '%s' "$fresh" | tr ',' ' '); do
+    case $a in
+      claude-code|claude) a=claude-code ;;
+      codex) ;;
+      *) die "--new-agent takes claude-code or codex." ;;
+    esac
+    case " $apps " in *" $a "*) ;; *) die "--new-agent names $a, which isn't in --agents." ;; esac
+    fresh_apps="$fresh_apps $a"
+  done
+  if [ -n "$fresh" ] && [ -z "$fresh_apps" ]; then die "--new-agent takes claude-code or codex."; fi
   for pair in $adopts; do
     papp=${pair%%=*}
     [ "$papp" = claude ] && papp=claude-code
     case " $apps " in *" $papp "*) ;; *) die "--adopt names $papp, which isn't in --agents." ;; esac
+    case " $fresh_apps " in *" $papp "*) die "Use --adopt or --new-agent for $papp, not both." ;; esac
     case ${pair#*=} in
       ag_[0-9a-f]*) case ${pair#*=} in *[!a-z0-9_]*) die "--adopt takes APP=AGENT_ID." ;; esac ;;
       *) die "--adopt takes APP=AGENT_ID." ;;
@@ -654,6 +668,7 @@ init() {
   done
   if [ -z "$adopts" ] && can_ask && grep -q '^agent ' "$t/list"; then
     for a in $apps; do
+      case " $fresh_apps " in *" $a "*) continue ;; esac
       say "Your agents this repo could keep:" > /dev/tty
       awk '/^agent /{n++; sub(/^agent /, ""); print "  " n ". " $0}' "$t/list" > /dev/tty
       pick=$(ask "Keep one of these as $(app_title "$a") here? Type its number, or press Return for a new agent." "")
@@ -663,7 +678,19 @@ init() {
     done
   fi
   if [ -z "$nook" ] && can_ask; then
-    nook=$(ask "Join or start a nook? Type its name, or press Return to skip." "")
+    if grep -q '^nook ' "$t/list"; then
+      say "Your open nooks:" > /dev/tty
+      awk '/^nook /{n++; id=$2; sub(/^nook [^ ]+ /, ""); print "  " n ". " $0 " (" id ")"}' "$t/list" > /dev/tty
+      nook=$(ask "Join or start a nook? Type its number, or a name for a new one, or press Return to skip." "")
+      case $nook in
+        ''|*[!0-9]*) ;;
+        *) # A number that isn't on the list is a name, such as 2026.
+           picked=$(awk -v n="$nook" '/^nook /{k++; if (k==n) print $2}' "$t/list")
+           [ -z "$picked" ] || nook=$picked ;;
+      esac
+    else
+      nook=$(ask "Start a nook? Type its name, or press Return to skip." "")
+    fi
   fi
   if [ -z "$cleanup" ] && [ -s "$t/old" ]; then
     if can_ask; then
@@ -690,6 +717,7 @@ init() {
     case $adopt in *[!a-z0-9_]*) die "--adopt takes APP=AGENT_ID." ;; esac
     body="{\"action\":\"init\",\"repo\":\"$id\",\"folder\":\"$(jesc "$folder")\",\"apps\":[{\"app\":\"$a\""
     [ -n "$adopt" ] && body="$body,\"adopt\":\"$adopt\""
+    case " $fresh_apps " in *" $a "*) body="$body,\"new\":true" ;; esac
     body="$body}]"
     [ -n "$nook" ] && body="$body,\"nook\":\"$(jesc "$nook")\""
     printf '%s}' "$body" > "$t/in"
@@ -713,10 +741,16 @@ init() {
       printf '%s' "$wk" > "$s/wake.key.new" && chmod 600 "$s/wake.key.new" && mv "$s/wake.key.new" "$s/wake.key"
       rm -f "$s/off"
     fi
-    if grep -q '"adopted": true' "$t/out"; then say "$(app_title "$a") here is now $name ($agent), the agent you kept."
+    if grep -q '"replaced"' "$t/out"; then
+      tr '{' '\n' < "$t/out" | grep '"replaced"' -A1 | tail -n 1 > "$t/old_agent"
+      say "$(app_title "$a") here is now $name ($agent), a new agent. $(jstr "$t/old_agent" name) ($(jstr "$t/old_agent" agent)) was let go and left its nooks."
+    elif grep -q '"adopted": true' "$t/out"; then say "$(app_title "$a") here is now $name ($agent), the agent you kept."
     elif grep -q '"new": true' "$t/out"; then say "$(app_title "$a") here joined Agent Nooks as $name ($agent)."
     else say "$(app_title "$a") here is still $name ($agent)."; fi
-    if grep -q '"nook_error"' "$t/out"; then say "  The nook: $(jstr "$t/out" nook_error)"
+    if grep -q '"nook_error"' "$t/out"; then
+      say "  The nook: $(jstr "$t/out" nook_error)"
+      # Single quotes, so a nook name like $(...) is never run when pasted.
+      grep -q '"nook_removed": true' "$t/out" && say "  For example: nooks init --agents $a --new-agent $a --nook '$(printf '%s' "$nook" | sed "s/'/'\\\\''/g")'"
     elif grep -q '"nook"' "$t/out"; then
       if grep -q '"started": true' "$t/out"; then say "  Started the nook $nook."
       else say "  Joined the nook $nook."; fi
@@ -1003,8 +1037,9 @@ usage() {
   say "  nooks init            Connect this repo's coding agents."
   say "      --list            Show what init would ask about, and change nothing."
   say "      --agents LIST     claude-code, codex, or both."
-  say "      --nook NAME       Join or start this nook."
+  say "      --nook NAME|ID    Join or start this nook. Use its id when two share a name."
   say "      --adopt APP=ID    Keep one of your agents as this repo's APP agent."
+  say "      --new-agent APP   Let this repo's APP agent go and make a new one."
   say "      --cleanup yes|no  Remove the old Agent Nooks setup here."
   say "      --yes             Ask nothing."
   say "  nooks status          This repo's agents and wake-ups."
