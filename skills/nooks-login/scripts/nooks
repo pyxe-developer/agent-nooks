@@ -1,5 +1,5 @@
 #!/bin/sh
-# Agent Nooks command, version 0.6.2, from https://app.agentnooks.com/skills/nooks/nooks
+# Agent Nooks command, version 0.6.3, from https://app.agentnooks.com/skills/nooks/nooks
 #   nooks auth login [--no-wait] | auth wait | auth status | auth logout
 #   nooks init [--list] [--agents claude-code,codex] [--nook NAME|ID]
 #              [--adopt APP=AGENT_ID] [--new-agent APP] [--cleanup yes|no] [--yes]
@@ -7,7 +7,7 @@
 # Run by your coding agent, not by you:
 #   nooks mcp claude-code|codex [DIR]
 #   nooks hook prompt|listen claude-code
-version='0.6.2'
+version='0.6.3'
 default_origin='https://app.agentnooks.com'
 origin=${NOOKS_ORIGIN:-$default_origin}
 home=${NOOKS_HOME:-$HOME/.agent-nooks}
@@ -718,6 +718,12 @@ init() {
     body="{\"action\":\"init\",\"repo\":\"$id\",\"folder\":\"$(jesc "$folder")\",\"apps\":[{\"app\":\"$a\""
     [ -n "$adopt" ] && body="$body,\"adopt\":\"$adopt\""
     case " $fresh_apps " in *" $a "*) body="$body,\"new\":true" ;; esac
+    if [ "$a" = claude-code ]; then
+      # The wake key this computer already holds here: the server keeps it
+      # when it still works, so a session waiting with it isn't cut off.
+      held=$(cat "$(state_dir "$id" "$a")/wake.key" 2>/dev/null)
+      case $held in nkl_*) case $held in *[!A-Za-z0-9_-]*) ;; *) [ ${#held} -eq 47 ] && body="$body,\"wake_key\":\"$held\"" ;; esac ;; esac
+    fi
     body="$body}]"
     [ -n "$nook" ] && body="$body,\"nook\":\"$(jesc "$nook")\""
     printf '%s}' "$body" > "$t/in"
@@ -739,6 +745,8 @@ init() {
     wk=$(jstr "$t/out" wake_key)
     if [ -n "$wk" ]; then
       printf '%s' "$wk" > "$s/wake.key.new" && chmod 600 "$s/wake.key.new" && mv "$s/wake.key.new" "$s/wake.key"
+      rm -f "$s/off"
+    elif grep -q '"wake_key_kept": true' "$t/out"; then
       rm -f "$s/off"
     fi
     if grep -q '"replaced"' "$t/out"; then
@@ -905,7 +913,10 @@ hook_setup() {
 hook_prompt() {
   hook_setup
   printf '%s %s\n' "$sid" "$cp" > "$s/active.new" && mv "$s/active.new" "$s/active"
-  if [ -e "$s/off" ] && [ ! "$kf" -nt "$s/off" ]; then take_wake; fi
+  if [ -e "$s/off" ] && [ ! "$kf" -nt "$s/off" ]; then take_wake
+  # A waiting session's key was just refused and it is still looking for a
+  # new one: a message now takes wake-ups back, as it would after it stops.
+  elif [ -e "$s/refused" ] && [ ! "$kf" -nt "$s/refused" ]; then take_wake; fi
   exit 0
 }
 
@@ -917,7 +928,7 @@ take_wake() {
     if [ "$code" = 200 ]; then
       wk=$(jstr "$t/out" wake_key)
       case $wk in
-        nkl_*) printf '%s' "$wk" > "$kf.new" && chmod 600 "$kf.new" && mv "$kf.new" "$kf" && rm -f "$s/off" ;;
+        nkl_*) printf '%s' "$wk" > "$kf.new" && chmod 600 "$kf.new" && mv "$kf.new" "$kf" && rm -f "$s/off" "$s/refused" ;;
       esac
     fi
   fi
@@ -1011,8 +1022,21 @@ hook_listen() {
       204) fresh=0; delay=5 ;;
       409) nap "${NOOKS_LOCAL_SECONDS:-5}" ;;
       401|403)
-        if [ "$(cat "$kf" 2>/dev/null)" != "$key" ]; then fresh=1; delay=5; continue; fi
+        # nooks init or a take here may be saving a new key right now: look
+        # for it a few seconds before giving up. Mark the refusal first, so a
+        # message sent meanwhile takes wake-ups back (hook_prompt).
+        touch "$s/refused"
+        tries=${NOOKS_REFUSED_SECONDS:-10}
+        case $tries in ''|*[!0-9]*) tries=10 ;; esac
+        while [ "$tries" -gt 0 ] && [ "$(cat "$kf" 2>/dev/null)" = "$key" ] && kill -0 "$cp" 2>/dev/null; do
+          nap 1
+          tries=$(( tries - 1 ))
+        done
+        # Mark it off before the last look, so a key saved at this moment
+        # (by nooks init or a message here) is never left behind an off mark.
         touch "$off"
+        if [ "$(cat "$kf" 2>/dev/null)" != "$key" ]; then rm -f "$off" "$s/refused"; fresh=1; delay=5; continue; fi
+        rm -f "$s/refused"
         echo "Agent Nooks refused this repo's wake key: another computer took wake-ups for this repo, or this one was signed out. Wake-ups come back here the next time your owner sends this session a message; if they don't, run nooks init in this repo again." >&2
         rm -f "$body" "$body.code" "$pf"
         exit 2 ;;
