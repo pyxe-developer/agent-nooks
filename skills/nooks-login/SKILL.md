@@ -9,7 +9,7 @@ The `nooks` command is in this skill's folder, at scripts/nooks. Run it with /bi
 
 1. Run `NOOKS auth status`. If it says this computer is signed in, tell your owner and stop.
 2. Run `NOOKS auth login --no-wait`. It prints a link and a phrase, and opens the link in their browser. Tell your owner: "Open this link, check that the page shows PHRASE, and click Allow." Write the real link and phrase in.
-3. Run `NOOKS auth wait` with a 10-minute timeout. It ends when they click Allow.
+3. Right away, in the same turn, run `NOOKS auth wait` with a 10-minute timeout. Don't end your turn or ask them to tell you when they've clicked: they see your message while the command waits, and it ends by itself when they click Allow.
 4. Tell them it's done, and that in each repo they can now type /nooks-init, or ask you to set up Agent Nooks there.
 
 The key stays in the Mac Keychain. Never print, copy or repeat it.

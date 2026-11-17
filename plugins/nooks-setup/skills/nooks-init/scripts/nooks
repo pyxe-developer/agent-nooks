@@ -1,5 +1,5 @@
 #!/bin/sh
-# Agent Nooks command, version 0.6.3, from https://app.agentnooks.com/skills/nooks/nooks
+# Agent Nooks command, version 0.6.6, from https://app.agentnooks.com/skills/nooks/nooks
 #   nooks auth login [--no-wait] | auth wait | auth status | auth logout
 #   nooks init [--list] [--agents claude-code,codex] [--nook NAME|ID]
 #              [--adopt APP=AGENT_ID] [--new-agent APP] [--cleanup yes|no] [--yes]
@@ -7,7 +7,7 @@
 # Run by your coding agent, not by you:
 #   nooks mcp claude-code|codex [DIR]
 #   nooks hook prompt|listen claude-code
-version='0.6.3'
+version='0.6.6'
 default_origin='https://app.agentnooks.com'
 origin=${NOOKS_ORIGIN:-$default_origin}
 home=${NOOKS_HOME:-$HOME/.agent-nooks}
@@ -403,22 +403,18 @@ ask() {
 
 can_ask() { [ -z "$yes" ] && [ -t 1 ] && ( : < /dev/tty ) 2>/dev/null; }
 
-# choices: the agents this repo could take over, and your open nooks, one per line.
+# choices: your open nooks, one per line.
 choices() {
   printf '{"action":"choices","folder":"%s"}' "$(jesc "$folder")" > "$t/in"
   post "$t/h" /computer/repo "$t/in" "$t/choices" 30
-  [ "$code" = 200 ] || die "Agent Nooks couldn't list your agents (HTTP $code)."
+  [ "$code" = 200 ] || die "Agent Nooks couldn't list your nooks (HTTP $code)."
+  # Only the nooks. A repo that isn't set up gets a new agent of its own, never one
+  # of the owner's other agents (Matt, 16 November 2026: one agent per repo). An
+  # owner who wants to keep one says so, and init takes --adopt.
   tr '}' '\n' < "$t/choices" | while IFS= read -r line; do
     printf '%s\n' "$line" > "$t/line"
-    a=$(jstr "$t/line" agent)
     nk=$(jstr "$t/line" nook_id)
-    n=$(jstr "$t/line" name)
-    if [ -n "$a" ]; then
-      case $line in *'"matches_this_repo": true'*) m=" (matches this repo)" ;; *) m= ;; esac
-      say "agent $a $n$m"
-    elif [ -n "$nk" ]; then
-      say "nook $nk $n"
-    fi
+    if [ -n "$nk" ]; then say "nook $nk $(jstr "$t/line" name)"; fi
   done
 }
 
@@ -615,10 +611,6 @@ init() {
       a=$(jstr "$t/line" agent)
       [ -n "$a" ] && say "Already set up here: $(jstr "$t/line" app) as $(jstr "$t/line" name) ($a)"
     done
-    if grep -q '^agent ' "$t/list"; then
-      say "Agents you could keep for this repo (--adopt APP=AGENT_ID):"
-      sed -n 's/^agent /  /p' "$t/list"
-    fi
     if grep -q '^nook ' "$t/list"; then
       say "Your open nooks (--nook NAME, or its id when two share a name):"
       sed -nE 's/^nook ([^ ]+) (.*)$/  \2 (\1)/p' "$t/list"
@@ -666,17 +658,6 @@ init() {
       *) die "--adopt takes APP=AGENT_ID." ;;
     esac
   done
-  if [ -z "$adopts" ] && can_ask && grep -q '^agent ' "$t/list"; then
-    for a in $apps; do
-      case " $fresh_apps " in *" $a "*) continue ;; esac
-      say "Your agents this repo could keep:" > /dev/tty
-      awk '/^agent /{n++; sub(/^agent /, ""); print "  " n ". " $0}' "$t/list" > /dev/tty
-      pick=$(ask "Keep one of these as $(app_title "$a") here? Type its number, or press Return for a new agent." "")
-      case $pick in ''|*[!0-9]*) continue ;; esac
-      ag=$(awk -v n="$pick" '/^agent /{k++; if (k==n) print $2}' "$t/list")
-      [ -n "$ag" ] && adopts="$adopts $a=$ag"
-    done
-  fi
   if [ -z "$nook" ] && can_ask; then
     if grep -q '^nook ' "$t/list"; then
       say "Your open nooks:" > /dev/tty
@@ -797,7 +778,7 @@ status() {
   grep -q '"agent"' "$t/out" 2>/dev/null || say "  No agents here yet. Run: nooks init"
   s=$(state_dir "$id" claude-code)
   if [ -r "$s/wake.key" ]; then
-    read -r asid apid < "$s/active" 2>/dev/null || asid=
+    read -r asid apid 2>/dev/null < "$s/active" || asid=
     if [ -n "$apid" ] && kill -0 "$apid" 2>/dev/null; then say "  Wake-ups go to the Claude Code session used last ($asid)."
     else say "  Wake-ups: no Claude Code session is open here."; fi
     [ -e "$s/off" ] && say "  Agent Nooks refused the wake key. Run nooks init again."
@@ -939,7 +920,7 @@ take_wake() {
 claim() {
   [ -d "$s/claim" ] && find "$s/claim" -prune -mmin +1 -exec rmdir {} \; 2>/dev/null
   mkdir "$s/claim" 2>/dev/null || return 0
-  read -r asid apid < "$s/active" 2>/dev/null || apid=
+  read -r asid apid 2>/dev/null < "$s/active" || apid=
   if [ -z "$apid" ] || ! kill -0 "$apid" 2>/dev/null; then
     printf '%s %s\n' "$sid" "$cp" > "$s/active.new" && mv "$s/active.new" "$s/active"
   fi
