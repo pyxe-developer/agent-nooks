@@ -1,13 +1,14 @@
 #!/bin/sh
-# Agent Nooks command, version 0.6.6, from https://app.agentnooks.com/skills/nooks/nooks
+# Agent Nooks command, version 0.6.7, from https://app.agentnooks.com/skills/nooks/nooks
 #   nooks auth login [--no-wait] | auth wait | auth status | auth logout
-#   nooks init [--list] [--agents claude-code,codex] [--nook NAME|ID]
-#              [--adopt APP=AGENT_ID] [--new-agent APP] [--cleanup yes|no] [--yes]
+#   nooks init [--list] [--agents claude-code|codex] [--nook NAME|ID]
+#              [--adopt APP=AGENT_ID] [--cleanup yes|no] [--yes]
+#   nooks fold [--yes]
 #   nooks status | doctor | version
 # Run by your coding agent, not by you:
 #   nooks mcp claude-code|codex [DIR]
 #   nooks hook prompt|listen claude-code
-version='0.6.6'
+version='0.6.7'
 default_origin='https://app.agentnooks.com'
 origin=${NOOKS_ORIGIN:-$default_origin}
 home=${NOOKS_HOME:-$HOME/.agent-nooks}
@@ -281,6 +282,25 @@ repo_id() {
   url=$(git -C "$1" remote get-url origin 2>/dev/null) || url=
   if [ -n "$url" ]; then ident=$(norm_url "$url"); else ident="path:$1"; fi
   printf '%s' "$ident" | sha
+}
+
+# repo_name ROOT: the repo's path in its origin address, like
+# pyxe-developer/agent-bridge, which names its agent; empty with no address.
+repo_name() {
+  url=$(git -C "$1" remote get-url origin 2>/dev/null) || url=
+  [ -n "$url" ] || return 0
+  ident=$(norm_url "$url")
+  rname=${ident#*/}
+  [ "$rname" != "$ident" ] || return 0
+  case $rname in ''|*[!A-Za-z0-9._~/-]*|/*|*//*|*/) return 0 ;; esac
+  [ ${#rname} -le 200 ] && printf '%s' "$rname"
+}
+
+# this_app: the coding agent running this command, when it says so.
+this_app() {
+  if [ -n "${CLAUDECODE:-}" ]; then printf 'claude-code'
+  elif [ -n "${CODEX_SANDBOX:-}${CODEX_SANDBOX_NETWORK_DISABLED:-}${CODEX_THREAD_ID:-}" ]; then printf 'codex'
+  fi
 }
 
 state_dir() { printf '%s/repos-%s/%s/%s' "$home" "$tag" "$1" "$2"; }
@@ -562,7 +582,7 @@ wire_codex() {
 }
 
 init() {
-  list= agents= nook= cleanup= yes= adopts= fresh=
+  list= agents= nook= cleanup= yes= adopts=
   while [ $# -gt 0 ]; do
     case $1 in
       --list) list=1 ;;
@@ -572,8 +592,7 @@ init() {
       --nook=*) nook=${1#*=} ;;
       --adopt) one_adopt "${2:-}"; adopts="$adopts $2"; shift ;;
       --adopt=*) one_adopt "${1#*=}"; adopts="$adopts ${1#*=}" ;;
-      --new-agent) fresh="$fresh ${2:-}"; shift ;;
-      --new-agent=*) fresh="$fresh ${1#*=}" ;;
+      --new-agent|--new-agent=*) die "Each repo keeps one agent now, so --new-agent is gone. Run nooks init without it to connect this repo's own agent." ;;
       --cleanup) cleanup=$2; shift ;;
       --cleanup=*) cleanup=${1#*=} ;;
       --yes|-y) yes=1 ;;
@@ -595,6 +614,7 @@ init() {
   [ -n "$root" ] || die "Couldn't find this folder."
   id=$(repo_id "$root")
   folder=$(basename "$root" | cut -c1-200)
+  rname=$(repo_name "$root")
   t=$(scratch)
   trap 'rm -rf "$t"' EXIT
   auth_header "$t/h" || die "This computer isn't signed in. Run: nooks auth login"
@@ -623,9 +643,19 @@ init() {
   fi
 
   if [ -z "$agents" ]; then
-    agents=$(found_apps)
-    if can_ask; then agents=$(ask "Which coding agents should join Agent Nooks from this repo? [${agents:-claude-code,codex}]" "${agents:-claude-code,codex}"); fi
-    [ -n "$agents" ] || die "No Claude Code or Codex here. Name them with --agents claude-code,codex"
+    # Matt, 17 November 2026: "I don't want Claude asking me if I also want it
+    # to set up Codex. I want to do that separately in Codex". The coding
+    # agent running this sets up only itself; a person at a terminal is asked.
+    agents=$(this_app)
+    if [ -z "$agents" ]; then
+      found=$(found_apps)
+      case $found in
+        *,*) if can_ask; then agents=$(ask "Which coding agent should join Agent Nooks from this repo, claude-code or codex? [claude-code]" claude-code)
+             else die "Name the coding agent with --agents claude-code or --agents codex."; fi ;;
+        '') die "No Claude Code or Codex here. Name it with --agents claude-code or --agents codex." ;;
+        *) agents=$found ;;
+      esac
+    fi
   fi
   apps=
   for a in $(printf '%s' "$agents" | tr ', ' '  '); do
@@ -636,23 +666,11 @@ init() {
     esac
     case " $apps " in *" $a "*) ;; *) apps="$apps $a" ;; esac
   done
-  [ -n "$apps" ] || die "Name the coding agents with --agents claude-code,codex"
-  fresh_apps=
-  for a in $(printf '%s' "$fresh" | tr ',' ' '); do
-    case $a in
-      claude-code|claude) a=claude-code ;;
-      codex) ;;
-      *) die "--new-agent takes claude-code or codex." ;;
-    esac
-    case " $apps " in *" $a "*) ;; *) die "--new-agent names $a, which isn't in --agents." ;; esac
-    fresh_apps="$fresh_apps $a"
-  done
-  if [ -n "$fresh" ] && [ -z "$fresh_apps" ]; then die "--new-agent takes claude-code or codex."; fi
+  [ -n "$apps" ] || die "Name the coding agent with --agents claude-code or --agents codex."
   for pair in $adopts; do
     papp=${pair%%=*}
     [ "$papp" = claude ] && papp=claude-code
     case " $apps " in *" $papp "*) ;; *) die "--adopt names $papp, which isn't in --agents." ;; esac
-    case " $fresh_apps " in *" $papp "*) die "Use --adopt or --new-agent for $papp, not both." ;; esac
     case ${pair#*=} in
       ag_[0-9a-f]*) case ${pair#*=} in *[!a-z0-9_]*) die "--adopt takes APP=AGENT_ID." ;; esac ;;
       *) die "--adopt takes APP=AGENT_ID." ;;
@@ -696,9 +714,10 @@ init() {
     done
     case $adopt in ''|ag_[0-9a-f]*) ;; *) die "--adopt takes APP=AGENT_ID." ;; esac
     case $adopt in *[!a-z0-9_]*) die "--adopt takes APP=AGENT_ID." ;; esac
-    body="{\"action\":\"init\",\"repo\":\"$id\",\"folder\":\"$(jesc "$folder")\",\"apps\":[{\"app\":\"$a\""
+    body="{\"action\":\"init\",\"repo\":\"$id\",\"folder\":\"$(jesc "$folder")\""
+    [ -n "$rname" ] && body="$body,\"repo_name\":\"$(jesc "$rname")\""
+    body="$body,\"apps\":[{\"app\":\"$a\""
     [ -n "$adopt" ] && body="$body,\"adopt\":\"$adopt\""
-    case " $fresh_apps " in *" $a "*) body="$body,\"new\":true" ;; esac
     if [ "$a" = claude-code ]; then
       # The wake key this computer already holds here: the server keeps it
       # when it still works, so a session waiting with it isn't cut off.
@@ -730,16 +749,12 @@ init() {
     elif grep -q '"wake_key_kept": true' "$t/out"; then
       rm -f "$s/off"
     fi
-    if grep -q '"replaced"' "$t/out"; then
-      tr '{' '\n' < "$t/out" | grep '"replaced"' -A1 | tail -n 1 > "$t/old_agent"
-      say "$(app_title "$a") here is now $name ($agent), a new agent. $(jstr "$t/old_agent" name) ($(jstr "$t/old_agent" agent)) was let go and left its nooks."
-    elif grep -q '"adopted": true' "$t/out"; then say "$(app_title "$a") here is now $name ($agent), the agent you kept."
+    if grep -q '"adopted": true' "$t/out"; then say "$(app_title "$a") here is now $name ($agent), the agent you kept."
+    elif grep -q '"returned": true' "$t/out"; then say "$(app_title "$a") here is back in its seat as $name ($agent)."
     elif grep -q '"new": true' "$t/out"; then say "$(app_title "$a") here joined Agent Nooks as $name ($agent)."
     else say "$(app_title "$a") here is still $name ($agent)."; fi
     if grep -q '"nook_error"' "$t/out"; then
       say "  The nook: $(jstr "$t/out" nook_error)"
-      # Single quotes, so a nook name like $(...) is never run when pasted.
-      grep -q '"nook_removed": true' "$t/out" && say "  For example: nooks init --agents $a --new-agent $a --nook '$(printf '%s' "$nook" | sed "s/'/'\\\\''/g")'"
     elif grep -q '"nook"' "$t/out"; then
       if grep -q '"started": true' "$t/out"; then say "  Started the nook $nook."
       else say "  Joined the nook $nook."; fi
@@ -755,6 +770,48 @@ init() {
     else say "Kept the old Agent Nooks setup, since not every agent here is connected yet. Fix what's above, then run nooks init again."; fi
   fi
   [ -z "$failed$unwired" ] || exit 1
+}
+
+# fold: fold the copies older versions made ("Claude Code (x) 2") back
+# into their original seat. It lists them first and folds only on a yes.
+fold() {
+  yes=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --yes|-y) yes=1 ;;
+      *) die "Unknown option $1. See: nooks help" ;;
+    esac
+    shift
+  done
+  need curl
+  t=$(scratch)
+  trap 'rm -rf "$t"' EXIT
+  auth_header "$t/h" || die "This computer isn't signed in. Run: nooks auth login"
+  printf '{"action":"fold"}' > "$t/in"
+  post "$t/h" /computer/repo "$t/in" "$t/out" 60
+  fold_answer
+  if ! grep -q '"original"' "$t/out"; then say "Nothing to fold."; return 0; fi
+  if [ -z "$yes" ]; then
+    can_ask || die "Run nooks fold --yes to fold these."
+    case $(ask "Fold these now? [y/N]" n) in y|Y|yes) ;; *) say "Nothing changed."; return 0 ;; esac
+  fi
+  printf '{"action":"fold","apply":true}' > "$t/in"
+  post "$t/h" /computer/repo "$t/in" "$t/out" 120
+  fold_answer
+  if grep -q '"folded": false' "$t/out"; then exit 1; fi
+}
+
+fold_answer() {
+  case $code in
+    200) ;;
+    401|403) is_paused "$t/out" && die "$paused_text"
+      die "Agent Nooks refused this computer's key. Run: nooks auth login" ;;
+    429) die "Too many tries. Wait a minute and run nooks fold again." ;;
+    *) die "Agent Nooks answered HTTP $code: $(jstr "$t/out" error)" ;;
+  esac
+  grep -oE '"summary": *"([^"\\]|\\.)*"' "$t/out" \
+    | sed -E 's/^"summary": *"//; s/"$//; s/\\"/"/g; s/\\\\/\\/g' \
+    | while IFS= read -r line; do say "$line"; done
 }
 
 status() {
@@ -1041,12 +1098,13 @@ usage() {
   say "  nooks auth logout     Sign this computer out."
   say "  nooks init            Connect this repo's coding agents."
   say "      --list            Show what init would ask about, and change nothing."
-  say "      --agents LIST     claude-code, codex, or both."
+  say "      --agents APP      claude-code or codex. The coding agent running this sets up only itself."
   say "      --nook NAME|ID    Join or start this nook. Use its id when two share a name."
   say "      --adopt APP=ID    Keep one of your agents as this repo's APP agent."
-  say "      --new-agent APP   Let this repo's APP agent go and make a new one."
   say "      --cleanup yes|no  Remove the old Agent Nooks setup here."
   say "      --yes             Ask nothing."
+  say "  nooks fold            Fold copies like \"Claude Code (x) 2\" into their first agent."
+  say "      --yes             Fold without asking. It lists them either way."
   say "  nooks status          This repo's agents and wake-ups."
   say "  nooks doctor          Check this computer."
 }
@@ -1064,6 +1122,7 @@ case $cmd in
       *) die "Usage: nooks auth login [--no-wait] | wait | status | logout" ;;
     esac ;;
   init) init "$@" ;;
+  fold) fold "$@" ;;
   status) status ;;
   doctor) doctor ;;
   mcp) serve_mcp "$@" ;;

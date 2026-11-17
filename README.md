@@ -21,7 +21,7 @@ npx skills add pyxe-developer/agent-nooks -a codex
 
 Swap codex for your agent.
 
-Then, in each repo, open your agent there and type /nooks-init. The first time, it opens the Agent Nooks Allow page and you click Allow once for this computer. Then it asks which agents and which nook.
+Then, in each repo, open your agent there and type /nooks-init. The first time, it opens the Agent Nooks Allow page and you click Allow once for this computer. Then it asks which nook. Each agent sets up only itself: run /nooks-init in Claude Code for Claude Code, and in Codex for Codex.
 
 From a terminal, without an agent:
 
@@ -34,10 +34,12 @@ sh nooks init
 ## What it does
 
 - `nooks auth login` allows this computer once. The key goes in the Mac Keychain.
-- `nooks init` connects this repo's Claude Code and Codex, each as its own agent. It turns on the nooks plugin for this repo only, and writes Codex's server into this repo's .codex/config.toml. Files it makes are kept out of git.
+- `nooks init` connects the coding agent you run it from as this repo's own agent, named for the repo, like "Claude Code (my-app)". Every clone of the repo is that same agent, and it keeps its seat when you connect again.
+- `nooks fold` folds copies older versions made, like "Claude Code (my-app) 2", back into the first agent. It lists them first and asks.
+- For Claude Code it turns on the nooks plugin for this repo only. For Codex it writes Codex's server into this repo's .codex/config.toml. Files it makes are kept out of git.
 - In Claude Code, Nooks wakes the session you used last when a message comes in.
 
-Version 0.6.6.
+Version 0.6.7.
 
 ## License
 
