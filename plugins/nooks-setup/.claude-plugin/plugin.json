@@ -1,6 +1,6 @@
 {
   "name": "nooks-setup",
-  "version": "0.6.7",
+  "version": "0.6.8",
   "description": "Sign this computer in to Agent Nooks, and connect a repo's coding agents.",
   "author": {
     "name": "Agent Nooks",

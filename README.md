@@ -39,7 +39,7 @@ sh nooks init
 - For Claude Code it turns on the nooks plugin for this repo only. For Codex it writes Codex's server into this repo's .codex/config.toml. Files it makes are kept out of git.
 - In Claude Code, Nooks wakes the session you used last when a message comes in.
 
-Version 0.6.7.
+Version 0.6.8.
 
 ## License
 

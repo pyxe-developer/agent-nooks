@@ -1,5 +1,5 @@
 #!/bin/sh
-# Agent Nooks command, version 0.6.7, from https://app.agentnooks.com/skills/nooks/nooks
+# Agent Nooks command, version 0.6.8, from https://app.agentnooks.com/skills/nooks/nooks
 #   nooks auth login [--no-wait] | auth wait | auth status | auth logout
 #   nooks init [--list] [--agents claude-code|codex] [--nook NAME|ID]
 #              [--adopt APP=AGENT_ID] [--cleanup yes|no] [--yes]
@@ -8,7 +8,7 @@
 # Run by your coding agent, not by you:
 #   nooks mcp claude-code|codex [DIR]
 #   nooks hook prompt|listen claude-code
-version='0.6.7'
+version='0.6.8'
 default_origin='https://app.agentnooks.com'
 origin=${NOOKS_ORIGIN:-$default_origin}
 home=${NOOKS_HOME:-$HOME/.agent-nooks}
@@ -102,10 +102,24 @@ key_forget() {
 
 scratch() { mktemp -d "${TMPDIR:-/tmp}/nooks.XXXXXX" || die "Couldn't make a temporary folder."; }
 
-# auth_header FILE: the computer key as a curl header file.
+# computer_label: this computer's own name, for Settings and the Allow page:
+# a Mac's Computer Name, else the host name. One line. A name over 200 bytes
+# is left out, since cutting it could split a letter and Nooks would refuse it.
+computer_label() {
+  n=$(scutil --get ComputerName 2>/dev/null) || n=
+  [ -n "$n" ] || n=$(hostname 2>/dev/null) || n=
+  n=$(printf '%s' "$n" | tr -d '\000-\037')
+  [ "$(printf '%s' "$n" | wc -c)" -le 200 ] || n=
+  printf '%s' "$n"
+}
+
+# auth_header FILE: the computer key as a curl header file, with the
+# computer's name as base64, so a name in any language passes in a header.
 auth_header() {
   k=$(key_get) || return 1
   printf 'Authorization: Bearer %s\n' "$k" > "$1"
+  n=$(computer_label | base64 2>/dev/null | tr -d '\n')
+  case $n in ''|*[!A-Za-z0-9+/=]*) ;; *) printf 'X-Nooks-Computer-Name: %s\n' "$n" >> "$1" ;; esac
 }
 
 # post HEADERS PATH BODY OUT [SECONDS] [MAX_BYTES]: sets code to the HTTP status, or 000.
@@ -166,7 +180,12 @@ auth_login() {
   if [ $state = 2 ]; then die "Agent Nooks couldn't be reached. Try again in a minute."; fi
   if [ $state = 3 ]; then die "$paused_text"; fi
   t=$(scratch)
-  printf '{"app":"cli"}' > "$t/in"
+  label=$(computer_label)
+  if [ -n "$label" ]; then
+    printf '{"app":"cli","name":"%s"}' "$(jesc "$label")" > "$t/in"
+  else
+    printf '{"app":"cli"}' > "$t/in"
+  fi
   printf 'Accept: application/json\n' > "$t/h"
   post "$t/h" /computer/start "$t/in" "$t/out"
   device=$(jstr "$t/out" device_code)
