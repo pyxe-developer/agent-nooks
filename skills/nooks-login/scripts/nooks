@@ -1,14 +1,15 @@
 #!/bin/sh
-# Agent Nooks command, version 0.7.1, from https://app.agentnooks.com/skills/nooks/nooks
+# Agent Nooks command, version 0.8.0, from https://app.agentnooks.com/skills/nooks/nooks
 #   nooks auth login [--no-wait] | auth wait | auth status | auth logout
 #   nooks init [--list] [--agents claude-code|codex] [--nook NAME|ID]
-#              [--adopt APP=AGENT_ID] [--cleanup yes|no] [--codex-wakes yes|no] [--yes]
+#              [--adopt APP=AGENT_ID] [--cleanup yes|no] [--codex-wakes yes|no]
+#              [--everyday go|ask] [--go STEPS|none] [--yes]
 #   nooks fold [--yes]
 #   nooks status | doctor | version
 # Run by your coding agent, not by you:
 #   nooks mcp claude-code|codex [DIR]
 #   nooks hook prompt|listen claude-code | hook prompt codex DIR
-version='0.7.1'
+version='0.8.0'
 default_origin='https://app.agentnooks.com'
 origin=${NOOKS_ORIGIN:-$default_origin}
 home=${NOOKS_HOME:-$HOME/.agent-nooks}
@@ -1309,6 +1310,21 @@ ask() {
 }
 
 can_ask() { [ -z "$yes" ] && [ -t 1 ] && ( : < /dev/tty ) 2>/dev/null; }
+
+# The bigger steps an owner answers for, in the order Nooks asks (nooks.choices).
+choice_steps='create add_agents invite join remove let_go_on wake_off rename'
+step_words() {
+  case $1 in
+    create) say "Start a nook" ;;
+    add_agents) say "Add your other agents to a nook" ;;
+    invite) say "Invite another person to a nook" ;;
+    join) say "Join a nook you were invited to" ;;
+    remove) say "Remove an agent from a nook" ;;
+    let_go_on) say "Let a paused nook go on" ;;
+    wake_off) say "Turn off its wake-ups" ;;
+    rename) say "Change its name" ;;
+  esac
+}
 
 # choices: your open nooks, one per line.
 choices() {
@@ -2934,24 +2950,27 @@ managed_claude_origin() {
   printf '%s\n' "$1" | sed -nE 's/^[[:space:]]*NOOKS_ORIGIN=([^[:space:]]*).*$/\1/p' | head -n 1
 }
 
-# allow_nooks_tools PLUGIN: let the nooks plugin's own tools run without a
-# permission prompt in this repo only, so a wake-up that runs with no one
-# there doesn't stop on one in manual mode. Matt chose this on 19 November
-# 2026 ("Pre-approve"). It adds one allow rule, mcp__plugin_NAME_nooks__*,
-# to the repo's .claude/settings.local.json, Claude Code's settings for
-# this person in this project only, and changes nothing else there. A file
-# or folder that is a link, or a file that isn't the JSON object Claude Code
-# writes, is left as it is, and the owner is told what to add. So is one
-# nooks can't read or write: only exit 10 means the rule was already there,
-# never an error's own exit (independent standards review of PR 264).
+# allow_nooks_tools PLUGIN: set Claude Code's own permission for each nooks
+# tool in this repo from the owner's setup answers (issue #270). Matt, 20
+# November 2026: "Pre-approve should be user configurable", and "the nooks
+# instructions cannot conflict with the agent's permissions as set by the
+# user". Reading tools and the steps the owner said go to get an allow rule,
+# mcp__plugin_NAME_nooks__TOOL; the steps they said to ask about get an ask
+# rule, which Claude Code checks before any allow rule. The one wildcard
+# allow rule nooks 0.7 wrote is taken out. Nothing else in the repo's
+# .claude/settings.local.json changes. A file or folder that is a link, or a
+# file that isn't the JSON object Claude Code writes, is left as it is, and
+# the owner is told what to add. So is one nooks can't read or write.
 allow_nooks_tools() {
   _an=$(printf '%s' "${1%%@*}" | sed 's/[^A-Za-z0-9_-]/_/g')
-  _ar="mcp__plugin_${_an}_nooks__*"
+  _ap="mcp__plugin_${_an}_nooks__"
   _af="$root/.claude/settings.local.json"
   _ax=5
   if toml_py; then
     "$py" -I -c 'import json, os, stat, sys, tempfile
-def add(path, rule):
+def names(text):
+    return [name for name in text.split(",") if name]
+def put(path, prefix, allowed, asked):
     folder = os.path.dirname(path)
     if os.path.islink(folder) or os.path.islink(path):
         return 3
@@ -2971,11 +2990,20 @@ def add(path, rule):
     if not isinstance(rules, dict):
         return 4
     allow = rules.setdefault("allow", [])
-    if not isinstance(allow, list):
+    ask = rules.setdefault("ask", [])
+    if not isinstance(allow, list) or not isinstance(ask, list):
         return 4
-    if rule in allow:
+    before = json.dumps(data, sort_keys=True)
+    wanted_allow = [prefix + name for name in allowed]
+    wanted_ask = [prefix + name for name in asked]
+    allow[:] = [rule for rule in allow if rule != prefix + "*" and rule not in wanted_ask]
+    ask[:] = [rule for rule in ask if rule not in wanted_allow]
+    allow.extend(rule for rule in wanted_allow if rule not in allow)
+    ask.extend(rule for rule in wanted_ask if rule not in ask)
+    if not ask:
+        del rules["ask"]
+    if json.dumps(data, sort_keys=True) == before:
         return 10
-    allow.append(rule)
     os.makedirs(folder, exist_ok=True)
     handle, part = tempfile.mkstemp(dir=folder, prefix=".settings.local.json.", suffix=".nooks")
     try:
@@ -2989,18 +3017,26 @@ def add(path, rule):
         raise
     return 0
 try:
-    sys.exit(add(sys.argv[1], sys.argv[2]))
+    sys.exit(put(sys.argv[1], sys.argv[2], names(sys.argv[3]), names(sys.argv[4])))
 except Exception:
     sys.exit(5)
-' "$_af" "$_ar" 2>/dev/null
+' "$_af" "$_ap" "$tools_allow" "$tools_ask" 2>/dev/null
     _ax=$?
   fi
   case $_ax in
-    0) say "Claude Code: the nooks tools run without a permission prompt in this repo, so wake-ups don't stop to ask." ;;
-    10) say "Claude Code: the nooks tools already run without a permission prompt in this repo." ;;
-    *) say "Claude Code: the nooks tools weren't pre-approved here, so a wake-up may stop on a permission prompt. To pre-approve them, add \"$_ar\" to \"permissions\": {\"allow\": [...]} in $_af." ;;
+    0|10) if [ -n "$tools_ask" ]; then
+        say "Claude Code: the nooks tools follow your answers here. It asks you before: $(printf '%s' "$tools_ask" | sed 's/,/, /g')."
+      else
+        say "Claude Code: the nooks tools follow your answers here, and none of them asks you first."
+      fi ;;
+    *) say "Claude Code: the nooks tools' permissions weren't set here, so Claude Code may ask before each one. To set them, add these to \"permissions\" in $_af: \"allow\": [$(printf '%s' "$tools_allow" | sed "s/[^,]*/\"$_ap&\"/g")], \"ask\": [$(printf '%s' "$tools_ask" | sed "s/[^,]*/\"$_ap&\"/g")]." ;;
   esac
   return 0
+}
+
+# tool_list TEXT: TEXT when it is a comma list of nooks tool names, else nothing.
+tool_list() {
+  case $1 in *[!a-z_,]*) ;; *) printf '%s' "$1" ;; esac
 }
 
 wire_claude() {
@@ -3089,7 +3125,19 @@ read_project_codex_config() {
   where=$(printf '%s' "$root" | sed 's/[\\"]/\\&/g')
   env_home=
   if [ "$home" != "$HOME/.agent-nooks" ]; then env_home=', NOOKS_HOME = "'${path%/bin/nooks}'"'; fi
-  block=$(printf '[mcp_servers.nooks]\ncommand = "/bin/sh"\nargs = ["%s", "mcp", "codex", "%s"]\nenv = { NOOKS_ORIGIN = "%s"%s }\ndefault_tools_approval_mode = "approve"\n' "$path" "$where" "$origin" "$env_home")
+  # Issue #270: Codex's own approval for each nooks tool follows the owner's
+  # setup answers, saved by nooks init. Reading tools need no approval
+  # ("writes"); a step the owner said go to is "approve", and one they said
+  # to ask about is "prompt" (codex-rs mcp_types.rs, McpServerToolConfig).
+  block=$(printf '[mcp_servers.nooks]\ncommand = "/bin/sh"\nargs = ["%s", "mcp", "codex", "%s"]\nenv = { NOOKS_ORIGIN = "%s"%s }\ndefault_tools_approval_mode = "writes"\n' "$path" "$where" "$origin" "$env_home")
+  _ct="$(state_dir "$id" codex)/tool-approvals"
+  if [ -r "$_ct" ]; then
+    while read -r _tool _mode; do
+      case $_tool in ''|*[!a-z_]*) continue ;; esac
+      case $_mode in approve|prompt) ;; *) continue ;; esac
+      block=$(printf '%s\n[mcp_servers.nooks.tools.%s]\napproval_mode = "%s"\n' "$block" "$_tool" "$_mode")
+    done < "$_ct"
+  fi
   # The [mcp_servers.nooks] table now there, with its sub-tables, blank lines
   # left out. toml_on, above, never takes text inside a string or an array
   # for a table header.
@@ -3404,7 +3452,7 @@ choose_apps() {
 }
 
 init() {
-  list= agents= apps= nook= cleanup= yes= adopts= codex_choice= codex_off_done=
+  list= agents= apps= nook= cleanup= yes= adopts= codex_choice= codex_off_done= everyday= go_steps= prompted=
   while [ $# -gt 0 ]; do
     case $1 in
       --list) list=1 ;;
@@ -3419,6 +3467,10 @@ init() {
       --cleanup=*) cleanup=${1#*=} ;;
       --codex-wakes) codex_choice=${2:-}; case $codex_choice in yes|no) ;; *) die "--codex-wakes takes yes or no." ;; esac; shift ;;
       --codex-wakes=*) codex_choice=${1#*=}; case $codex_choice in yes|no) ;; *) die "--codex-wakes takes yes or no." ;; esac ;;
+      --everyday) everyday=${2:-}; shift ;;
+      --everyday=*) everyday=${1#*=} ;;
+      --go) go_steps=${2:-}; [ -n "$go_steps" ] || die "--go takes steps like create,join, or none."; shift ;;
+      --go=*) go_steps=${1#*=}; [ -n "$go_steps" ] || die "--go takes steps like create,join, or none." ;;
       --yes|-y) yes=1 ;;
       *) die "Unknown option $1. See: nooks help" ;;
     esac
@@ -3426,6 +3478,11 @@ init() {
   done
   need curl
   need git
+  case $everyday in ''|go|ask) ;; *) die "--everyday takes go or ask." ;; esac
+  [ "$go_steps" = none ] && go_steps=,
+  for step in $(printf '%s' "$go_steps" | tr ',' ' '); do
+    case " $choice_steps " in *" $step "*) ;; *) die "--go takes steps from: $(printf '%s' "$choice_steps" | sed 's/ /,/g'), or none." ;; esac
+  done
   case $cleanup in ''|yes|no) ;; *) die "--cleanup takes yes or no." ;; esac
   case $codex_choice in ''|yes|no) ;; *) die "--codex-wakes takes yes or no." ;; esac
   root=$(repo_root .)
@@ -3476,7 +3533,14 @@ init() {
     tr '}' '\n' < "$t/status" | while IFS= read -r line; do
       printf '%s\n' "$line" > "$t/line"
       a=$(jstr "$t/line" agent)
-      [ -n "$a" ] && say "Already set up here: $(jstr "$t/line" app) as $(jstr "$t/line" name) ($a)"
+      [ -n "$a" ] || continue
+      say "Already set up here: $(jstr "$t/line" app) as $(jstr "$t/line" name) ($a)"
+      case $line in
+        *'"answered": true'*)
+          g=$(jstr "$t/line" go_actions)
+          say "  Setup answers: everyday $(jstr "$t/line" everyday); without asking: ${g:-none}" ;;
+        *) say "  Setup answers: not given yet (--everyday, --go)" ;;
+      esac
     done
     if grep -q '^nook ' "$t/list"; then
       say "Your open nooks (--nook NAME, or its id when two share a name):"
@@ -3542,6 +3606,33 @@ init() {
       choose_codex_wakes locked
     fi ;;
   esac
+  # Issue #270: an agent with no setup answers yet gets them now. The coding
+  # agent running this asks its owner and passes --everyday and --go; a
+  # person at a terminal is asked here.
+  printf '{"action":"status","repo":"%s"}' "$id" > "$t/in"
+  post "$t/h" /computer/repo "$t/in" "$t/status" 30
+  unanswered=
+  for a in $apps; do
+    tr '}' '\n' < "$t/status" | grep -F "\"app\": \"$(app_title "$a")\"" | grep -q '"answered": true' \
+      || unanswered="$unanswered $a"
+  done
+  if [ -n "$unanswered" ] && [ -z "$everyday$go_steps" ] && can_ask; then
+    # Answers asked here are for the agents that had none: an agent with
+    # saved answers keeps them (Codex review of PR 271).
+    prompted=1
+    case $(ask "May this repo's agent read and answer nook messages, and save shared notes, files and to-dos, without asking you each time? [Y/n]" y) in
+      n|N|no) everyday=ask ;; *) everyday=go ;;
+    esac
+    say "Which of these may it do without asking you first?" > /dev/tty
+    n=0
+    for step in $choice_steps; do n=$((n + 1)); say "  $n. $(step_words "$step")" > /dev/tty; done
+    picked=$(ask "Type their numbers, like 1 4, or press Return for none." "")
+    go_steps=,
+    for number in $(printf '%s' "$picked" | tr ',' ' '); do
+      n=0
+      for step in $choice_steps; do n=$((n + 1)); [ "$number" = "$n" ] && go_steps="$go_steps$step,"; done
+    done
+  fi
   save_self
   failed= unwired=
   for a in $apps; do
@@ -3570,6 +3661,11 @@ init() {
     fi
     body="$body}]"
     [ -n "$nook" ] && body="$body,\"nook\":\"$(jesc "$nook")\""
+    case " $unanswered " in *" $a "*) mine=1 ;; *) mine= ;; esac
+    if [ -z "$prompted" ] || [ -n "$mine" ]; then
+      [ -n "$everyday" ] && body="$body,\"everyday\":\"$everyday\""
+      [ -n "$go_steps" ] && body="$body,\"go_actions\":\"$go_steps\""
+    fi
     printf '%s}' "$body" > "$t/in"
     post "$t/h" /computer/repo "$t/in" "$t/out" 60
     case $code in
@@ -3609,6 +3705,19 @@ init() {
     elif grep -q '"nook"' "$t/out"; then
       if grep -q '"started": true' "$t/out"; then say "  Started the nook $nook."
       else say "  Joined the nook $nook."; fi
+    fi
+    # Issue #270: each nooks tool's own permission in this app follows the
+    # owner's setup answers.
+    tools_allow=$(tool_list "$(jstr "$t/out" read_tools),$(jstr "$t/out" go_tools)")
+    tools_ask=$(tool_list "$(jstr "$t/out" ask_tools)")
+    if [ "$a" = codex ]; then
+      { for tool in $(printf '%s' "$(jstr "$t/out" go_tools)" | tr ',' ' '); do printf '%s approve\n' "$tool"; done
+        for tool in $(printf '%s' "$tools_ask" | tr ',' ' '); do printf '%s prompt\n' "$tool"; done
+      } > "$s/tool-approvals.$$" && mv "$s/tool-approvals.$$" "$s/tool-approvals" \
+        || { rm -f "$s/tool-approvals.$$"; say "Codex: couldn't save your answers for the nooks tools here."; }
+    fi
+    if ! grep -q '"answered": true' "$t/out"; then
+      say "  $(app_title "$a") asks you before each bigger step until you give your setup answers. Run nooks init again with --everyday and --go."
     fi
     # An app the server set up but this repo couldn't be wired for keeps
     # the old setup too: it may be the only way that app reaches Nooks.
@@ -4034,6 +4143,8 @@ usage() {
   say "      --adopt APP=ID    Keep one of your agents as this repo's APP agent."
   say "      --cleanup yes|no  Remove the old Agent Nooks setup here."
   say "      --codex-wakes yes|no  Opt in to Codex wakes in nooks where every agent is yours, or keep them off."
+  say "      --everyday go|ask Whether the agent reads and answers nook messages without asking you."
+  say "      --go STEPS|none   The bigger steps it may take without asking, like create,join. The rest it asks about."
   say "      --yes             Ask nothing."
   say "  nooks wakes off       Stop Codex wakes and remove their read guard once every issued wake is accounted for."
   say "  nooks fold            Fold copies like \"Claude Code (x) 2\" into their first agent."

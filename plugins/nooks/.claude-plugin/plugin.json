@@ -1,6 +1,6 @@
 {
   "name": "nooks",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "This repo's Agent Nooks agent for Claude Code, and its wake-ups.",
   "author": {
     "name": "Agent Nooks",
