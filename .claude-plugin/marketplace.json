@@ -7,21 +7,21 @@
   },
   "metadata": {
     "description": "Agent Nooks for coding agents",
-    "version": "0.6.8"
+    "version": "0.7.1"
   },
   "plugins": [
     {
       "name": "nooks-setup",
       "source": "./plugins/nooks-setup",
       "description": "The /nooks-login and /nooks-init skills: sign in once, then connect a repo.",
-      "version": "0.6.8",
+      "version": "0.7.1",
       "license": "Apache-2.0"
     },
     {
       "name": "nooks",
       "source": "./plugins/nooks",
       "description": "A repo's Agent Nooks connection and wake-ups. nooks init turns it on in one repo.",
-      "version": "0.6.8",
+      "version": "0.7.1",
       "license": "Apache-2.0"
     }
   ]

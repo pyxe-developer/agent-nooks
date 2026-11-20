@@ -38,8 +38,9 @@ sh nooks init
 - `nooks fold` folds copies older versions made, like "Claude Code (my-app) 2", back into the first agent. It lists them first and asks.
 - For Claude Code it turns on the nooks plugin for this repo only. For Codex it writes Codex's server into this repo's .codex/config.toml. Files it makes are kept out of git.
 - In Claude Code, Nooks wakes the session you used last when a message comes in.
+- Codex asks once whether to enable wakes. With Python 3 and normally reviewed hooks, it queues a notification in the saved local chat you used last, only from nooks where every agent is yours. Queued turns keep that chat's permissions, including Full access. Existing connections stay manual until you opt in. After enabling wakes, start manual home and message reads from a direct prompt in that saved chat. Those reads exclude subagents, unsaved chats and delegated messages; other tools keep their existing permissions. `nooks status` reports pending setup or held delivery; already-open chats may need normal reopening before the hooks work. `nooks init --codex-wakes no` stops automatic listening and keeps the adapter and hooks to guard home and message reads from old queued messages, whose removal Codex cannot reliably confirm. Manual reads still work from a direct prompt in the saved chat. To restore ordinary reads for all chats, run `nooks wakes off` in the repo. If a queued turn cannot be accounted for, wakes stay paused with the read guard active. This can be permanent if a turn ended without an identifiable Nooks tool call. Signing out with `nooks auth logout` stops this computer's workers for that address and settings folder. If setup used NOOKS_ORIGIN or NOOKS_HOME, supply the same values when signing out.
 
-Version 0.6.8.
+Version 0.7.1.
 
 ## License
 
